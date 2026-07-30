@@ -68,8 +68,8 @@ jobs:
           ZAMPTO_USERNAME: ${{ secrets.ZAMPTO_USERNAME }}
           ZAMPTO_PASSWORD: ${{ secrets.ZAMPTO_PASSWORD }}
           ZAMPTO_SERVER_ID: ${{ secrets.ZAMPTO_SERVER_ID }}
-          WXPUSHER_TOKEN: ${{ secrets.WXPUSHER_TOKEN }}
-          WXPUSHER_UID: ${{ secrets.WXPUSHER_UID }}
+          GOTIFY_URL: ${{ secrets.GOTIFY_URL }}
+          GOTIFY_TOKEN: ${{ secrets.GOTIFY_TOKEN }}
           FORCE_RENEW: ${{ github.event.inputs.force_renew || 'false' }}
           ENABLE_RECORDING: ${{ github.event.inputs.enable_recording || 'false' }}
         run: |

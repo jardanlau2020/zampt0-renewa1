@@ -4,7 +4,7 @@ Zampto Auto Renewal — CloakBrowser-based automation.
 
 Logs in via Logto, checks server status, starts if stopped,
 clicks renewal, waits for Cloudflare Turnstile, then pushes
-results via WxPusher.
+results via Gotify.
 """
 
 import os
@@ -23,8 +23,8 @@ from cloakbrowser import CloakBrowser
 USERNAME = os.getenv("ZAMPTO_USERNAME", "")
 PASSWORD = os.getenv("ZAMPTO_PASSWORD", "")
 SERVER_ID = os.getenv("ZAMPTO_SERVER_ID", "")
-WXPUSHER_TOKEN = os.getenv("WXPUSHER_TOKEN", "")
-WXPUSHER_UID = os.getenv("WXPUSHER_UID", "")
+GOTIFY_URL = os.getenv("GOTIFY_URL", "").rstrip("/")
+GOTIFY_TOKEN = os.getenv("GOTIFY_TOKEN", "")
 FORCE_RENEW = os.getenv("FORCE_RENEW", "false").lower() == "true"
 DASHBOARD_URL = "https://dash.zampto.net"
 
@@ -32,25 +32,24 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(me
 log = logging.getLogger("zampto")
 
 
-# ── WxPusher ────────────────────────────────────────────────────────────
+# ── Gotify ──────────────────────────────────────────────────────────────
 
-def push_wxpusher(title: str, body: str):
-    if not WXPUSHER_TOKEN or not WXPUSHER_UID:
-        log.warning("WxPusher not configured, skipping notification")
+def push_gotify(title: str, body: str):
+    if not GOTIFY_URL or not GOTIFY_TOKEN:
+        log.warning("Gotify not configured, skipping notification")
         return
+    url = f"{GOTIFY_URL}/message?token={GOTIFY_TOKEN}"
     payload = {
-        "appToken": WXPUSHER_TOKEN,
-        "uids": [WXPUSHER_UID],
         "title": title,
-        "content": body,
-        "contentType": 2,  # markdown
+        "message": body,
+        "level": 7,
     }
     try:
-        r = requests.post("https://wxpusher.zjiecode.com/api/send/message", json=payload, timeout=15)
+        r = requests.post(url, json=payload, timeout=15)
         r.raise_for_status()
-        log.info("WxPusher sent successfully")
+        log.info("Gotify sent successfully")
     except Exception as e:
-        log.error("WxPusher failed: %s", e)
+        log.error("Gotify failed: %s", e)
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────
@@ -279,7 +278,7 @@ def main():
 
     body = "\n".join(body_lines)
     log.info("--- Report ---\n%s", body)
-    push_wxpusher("🖥️ Zampto Server Report", body)
+    push_gotify("🖥️ Zampto Server Report", body)
 
     # Write report to JSON for potential downstream use
     with open("./screenshots/report.json", "w") as f:

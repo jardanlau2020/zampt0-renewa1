@@ -38,8 +38,8 @@ zampto/
 | `ZAMPTO_USERNAME` | Zampto 用户名（登录 Dashboard 用的账号） |
 | `ZAMPTO_PASSWORD` | Zampto 密码 |
 | `ZAMPTO_SERVER_ID` | 服务器 ID（见下方第 3 步） |
-| `WXPUSHER_TOKEN` | WxPusher App Token（见下方第 4 步） |
-| `WXPUSHER_UID` | WxPusher 用户 UID（见下方第 5 步） |
+| `GOTIFY_URL` | Gotify 服务器地址（见下方第 4 步） |
+| `GOTIFY_TOKEN` | Gotify 应用 Token（见下方第 4 步） |
 | `HY2_CONFIG` | Hysteria2 代理配置（可选，见下方第 6 步） |
 
 ### 3. 推送消息示例
@@ -55,20 +55,22 @@ zampto/
 _Generated: 2026-07-30T00:00:00Z_
 ```
 
-### 4. 获取 Server ID
+### 4. 配置 Gotify 推送通知（可选，推荐）
+
+1. 自建或托管 [Gotify](https://gotify.net) 服务
+2. 在 Gotify Web UI 中创建一个应用，复制其 **Token**
+3. 将 **Gotify 服务器地址**填入 `GOTIFY_URL`（如 `https://gotify.example.com`）
+4. 将 **应用 Token** 填入 `GOTIFY_TOKEN`
+
+> 如果不需要推送通知，这两个 Secret 可以不填，脚本会跳过通知。
+
+### 5. 获取 Server ID
 
 登录 Zampto Dashboard → 点进你的服务器 → 看浏览器地址栏：
 ```
 https://dash.zampto.net/server?id=123456
 ```
 URL 末尾的数字（如 `123456`）就是 Server ID，填入 `ZAMPTO_SERVER_ID`。
-
-### 5. 获取 WxPusher Token 和 UID
-
-前往 [WxPusher](https://wxpusher.zjiecode.com) 注册登录：
-
-1. 进入 **「应用管理」→「创建应用」**，获得 **App Token**（形如 `AT_xxxxxxxxxxxxxx`），填入 `WXPUSHER_TOKEN`
-2. 在 **「用户管理」** 页面用微信扫码绑定，即可获得 **UID**，填入 `WXPUSHER_UID`
 
 ### 6. 配置 HY2 代理（可选）
 
