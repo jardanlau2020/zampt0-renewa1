@@ -31,25 +31,18 @@ zampto/
 
 ### 2. 配置 Secrets
 
-进入仓库 **Settings → Secrets and variables → Actions → New repository secret**，添加：
+进入仓库 **Settings → Secrets and variables → Actions → New repository secret**，逐一创建以下 Secret：
 
 | Secret 名称 | 说明 |
 |---|---|
-| `ZAMPTO_USERNAME` | Zampto 用户名 |
+| `ZAMPTO_USERNAME` | Zampto 用户名（登录 Dashboard 用的账号） |
 | `ZAMPTO_PASSWORD` | Zampto 密码 |
-| `ZAMPTO_SERVER_ID` | 服务器 ID（URL 中的数字） |
-| `WXPUSHER_TOKEN` | WxPusher App Token |
-| `WXPUSHER_UID` | WxPusher 用户 UID |
-| `HY2_CONFIG` | Hysteria2 代理配置（可选） |
+| `ZAMPTO_SERVER_ID` | 服务器 ID（见下方第 3 步） |
+| `WXPUSHER_TOKEN` | WxPusher App Token（见下方第 4 步） |
+| `WXPUSHER_UID` | WxPusher 用户 UID（见下方第 5 步） |
+| `HY2_CONFIG` | Hysteria2 代理配置（可选，见下方第 6 步） |
 
-### 3. 获取 Server ID
-
-登录 Zampto Dashboard，点进服务器详情，URL 末尾的数字即为 Server ID：
-```
-https://dash.zampto.net/server?id=XXXX
-```
-
-## 推送消息示例
+### 3. 推送消息示例
 
 ```
 🖥️ Zampto Server Report
@@ -60,6 +53,42 @@ https://dash.zampto.net/server?id=XXXX
 **Expiry:** 30 days 0h 0m
 
 _Generated: 2026-07-30T00:00:00Z_
+```
+
+### 4. 获取 Server ID
+
+登录 Zampto Dashboard → 点进你的服务器 → 看浏览器地址栏：
+```
+https://dash.zampto.net/server?id=123456
+```
+URL 末尾的数字（如 `123456`）就是 Server ID，填入 `ZAMPTO_SERVER_ID`。
+
+### 5. 获取 WxPusher Token 和 UID
+
+前往 [WxPusher](https://wxpusher.zjiecode.com) 注册登录：
+
+1. 进入 **「应用管理」→「创建应用」**，获得 **App Token**（形如 `AT_xxxxxxxxxxxxxx`），填入 `WXPUSHER_TOKEN`
+2. 在 **「用户管理」** 页面用微信扫码绑定，即可获得 **UID**，填入 `WXPUSHER_UID`
+
+### 6. 配置 HY2 代理（可选）
+
+> 如果不需要代理访问 Zampto，**可跳过此步骤，不填 HY2_CONFIG**。
+
+在 `HY2_CONFIG` 中填入 YAML 格式的 Hysteria2 客户端配置：
+
+```yaml
+listen: 0.0.0.0:1080
+server: 你的HY2节点地址:端口
+up_mbps: 100
+down_mbps: 100
+obfs: salamander
+obfs-password: 你的混淆密码
+auth:
+  - 用户名:密码
+tls:
+  sni: 域名
+  insecure: true
+fastopen: true
 ```
 
 ## 注意事项
