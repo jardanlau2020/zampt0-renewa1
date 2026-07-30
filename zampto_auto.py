@@ -4,7 +4,7 @@ Zampto Auto Renewal — CloakBrowser-based automation.
 
 Logs in via Logto, checks server status, starts if stopped,
 clicks renewal, waits for Cloudflare Turnstile, then pushes
-results via Gotify.
+results via Telegram Bot.
 """
 
 import os
@@ -23,8 +23,8 @@ from cloakbrowser import CloakBrowser
 USERNAME = os.getenv("ZAMPTO_USERNAME", "")
 PASSWORD = os.getenv("ZAMPTO_PASSWORD", "")
 SERVER_ID = os.getenv("ZAMPTO_SERVER_ID", "")
-GOTIFY_URL = os.getenv("GOTIFY_URL", "").rstrip("/")
-GOTIFY_TOKEN = os.getenv("GOTIFY_TOKEN", "")
+TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "")
+TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
 FORCE_RENEW = os.getenv("FORCE_RENEW", "false").lower() == "true"
 DASHBOARD_URL = "https://dash.zampto.net"
 
@@ -32,24 +32,24 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(me
 log = logging.getLogger("zampto")
 
 
-# ── Gotify ──────────────────────────────────────────────────────────────
+# ── Telegram Bot ────────────────────────────────────────────────────────
 
-def push_gotify(title: str, body: str):
-    if not GOTIFY_URL or not GOTIFY_TOKEN:
-        log.warning("Gotify not configured, skipping notification")
+def push_tg(title: str, body: str):
+    if not TG_BOT_TOKEN or not TG_CHAT_ID:
+        log.warning("Telegram Bot not configured, skipping notification")
         return
-    url = f"{GOTIFY_URL}/message?token={GOTIFY_TOKEN}"
+    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
     payload = {
-        "title": title,
-        "message": body,
-        "level": 7,
+        "chat_id": TG_CHAT_ID,
+        "text": f"{title}\n\n{body}",
+        "parse_mode": "Markdown",
     }
     try:
         r = requests.post(url, json=payload, timeout=15)
         r.raise_for_status()
-        log.info("Gotify sent successfully")
+        log.info("Telegram message sent successfully")
     except Exception as e:
-        log.error("Gotify failed: %s", e)
+        log.error("Telegram push failed: %s", e)
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────
@@ -278,7 +278,7 @@ def main():
 
     body = "\n".join(body_lines)
     log.info("--- Report ---\n%s", body)
-    push_gotify("🖥️ Zampto Server Report", body)
+    push_tg("🖥️ Zampto Server Report", body)
 
     # Write report to JSON for potential downstream use
     with open("./screenshots/report.json", "w") as f:

@@ -10,7 +10,7 @@
 - ✅ 智能续期判断：剩余不足 48 小时自动续期
 - ✅ 支持 `FORCE_RENEW` 强制续期
 - ✅ 自动绕过 Cloudflare Turnstile 验证
-- ✅ WxPusher 推送服务器状态 + 到期时间
+- ✅ Telegram Bot 推送服务器状态 + 到期时间
 
 ## 项目结构
 
@@ -38,8 +38,8 @@ zampto/
 | `ZAMPTO_USERNAME` | Zampto 用户名（登录 Dashboard 用的账号） |
 | `ZAMPTO_PASSWORD` | Zampto 密码 |
 | `ZAMPTO_SERVER_ID` | 服务器 ID（见下方第 3 步） |
-| `GOTIFY_URL` | Gotify 服务器地址（见下方第 4 步） |
-| `GOTIFY_TOKEN` | Gotify 应用 Token（见下方第 4 步） |
+| `TG_BOT_TOKEN` | Telegram Bot Token（见下方第 4 步） |
+| `TG_CHAT_ID` | 接收消息的 Chat ID（见下方第 4 步） |
 | `HY2_CONFIG` | Hysteria2 代理配置（可选，见下方第 6 步） |
 
 ### 3. 推送消息示例
@@ -55,12 +55,13 @@ zampto/
 _Generated: 2026-07-30T00:00:00Z_
 ```
 
-### 4. 配置 Gotify 推送通知（可选，推荐）
+### 4. 配置 Telegram Bot 推送（可选，推荐）
 
-1. 自建或托管 [Gotify](https://gotify.net) 服务
-2. 在 Gotify Web UI 中创建一个应用，复制其 **Token**
-3. 将 **Gotify 服务器地址**填入 `GOTIFY_URL`（如 `https://gotify.example.com`）
-4. 将 **应用 Token** 填入 `GOTIFY_TOKEN`
+1. 在 Telegram 中打开 **@BotFather**，发送 `/newbot`，按提示创建 Bot
+2. 获得 **Bot Token**，填入 `TG_BOT_TOKEN`（格式如 `123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11`）
+3. 向你的用户或群组发送一条消息给 Bot
+4. 在浏览器访问 `https://api.telegram.org/bot你的TOKEN/getUpdates`
+5. 在返回的 JSON 中找到 `"chat": {"id": 123456789}`，将 `123456789` 填入 `TG_CHAT_ID`
 
 > 如果不需要推送通知，这两个 Secret 可以不填，脚本会跳过通知。
 
