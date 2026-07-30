@@ -51,17 +51,22 @@ jobs:
           pip install -r requirements.txt
           python -c "from cloakbrowser import ensure_binary; ensure_binary()"
 
-      - name: Start Hysteria2 proxy
+      - name: Start Hysteria2 proxy (optional)
         env:
           HY2_CONFIG: ${{ secrets.HY2_CONFIG }}
         run: |
-          curl -sL https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-amd64 -o hysteria
-          chmod +x hysteria
-          echo "$HY2_CONFIG" > config.yaml
-          ./hysteria client -c config.yaml &
-          sleep 5
-          echo "Direct IP: $(curl -s --max-time 5 ifconfig.me || echo 'fail')"
-          echo "Proxy IP: $(curl -s --max-time 10 --socks5 127.0.0.1:1080 ifconfig.me || echo 'proxy fail')"
+          if [ -z "$HY2_CONFIG" ]; then
+            echo "HY2_CONFIG not set, skipping proxy"
+            echo "Direct IP: $(curl -s --max-time 5 ifconfig.me || echo 'fail')"
+          else
+            curl -sL https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-amd64 -o hysteria
+            chmod +x hysteria
+            echo "$HY2_CONFIG" > config.yaml
+            ./hysteria client -c config.yaml &
+            sleep 5
+            echo "Direct IP: $(curl -s --max-time 5 ifconfig.me || echo 'fail')"
+            echo "Proxy IP: $(curl -s --max-time 10 --socks5 127.0.0.1:1080 ifconfig.me || echo 'proxy fail')"
+          fi
 
       - name: Run renewal
         env:
