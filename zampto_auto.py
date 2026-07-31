@@ -225,22 +225,55 @@ def phase_api_renewal(use_cookies=None):
     api_session = get_api_session()
     sync_cookies_to_session(api_session, cookies)
 
+    # Inject CSRF token from cookies into headers (required by /api/* endpoints)
+    csrf_token = find_csrf_cookie(cookies)
+    if csrf_token:
+        api_session.headers.update({
+            "X-CSRF-Token": csrf_token,
+            "X-XSRF-Token": csrf_token,
+            "X-Csrf-Token": csrf_token,
+        })
+        log.info("CSRF token injected into headers (length=%d)", len(csrf_token))
+    else:
+        log.warning("No CSRF cookie found - API calls may fail with 403")
+
+    # Add browser-like headers to satisfy Cloudflare and SameSite CSRF checks
+    api_session.headers.update({
+        "Referer": f"{DASHBOARD_URL}/",
+        "Origin": DASHBOARD_URL,
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin",
+    })
+
+    # Pre-define report so error handlers can use it
+    report = {
+        "server_id": SERVER_ID,
+        "status": "unknown",
+        "action": "none",
+        "expiry": None,
+        "error": None,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
     # Verify session by checking a safe endpoint
     try:
         test_resp = api_session.get(f"{DASHBOARD_URL}/auth/login", timeout=10)
-        # If we got the login page (HTML), that's good - means we have a session
         if test_resp.status_code == 200 and "antialiased" in test_resp.text[:500]:
             log.info("Session verified - authenticated")
         else:
-            log.warning("Unexpected response from login page: %d", test_resp.status_code)
+            log.warning("Unexpected response from login page: %d, body[:200]=%s", test_resp.status_code, test_resp.text[:200])
     except Exception as e:
-        log.error("Session verification failed: %e", e)
+        log.error("Session verification failed: %s", e)
 
     # Fetch server info
     try:
         server_url = f"{DASHBOARD_URL}/api/server/{SERVER_ID}"
         log.info("Fetching server info from: %s", server_url)
         resp = api_session.get(server_url, timeout=15)
+        if resp.status_code != 200:
+            log.error("API returned %d, body[:500]=%s", resp.status_code, resp.text[:500])
         resp.raise_for_status()
         server_data = resp.json()
         log.info("Server data received (truncated): %s", json.dumps(server_data, indent=2, ensure_ascii=False)[:600])
@@ -250,14 +283,13 @@ def phase_api_renewal(use_cookies=None):
         status_state = state_info.get("status", {}).get("state", "").lower() if isinstance(state_info, dict) else ""
         is_running = status_state in ["running", "started", "active", "online"]
 
-        report = {
-            "server_id": SERVER_ID,
+        report.update({
             "status": "running" if is_running else "stopped",
             "action": "none",
             "expiry": None,
             "error": None,
             "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
+        })
         log.info("Server status: %s", report["status"])
 
         # Start if stopped
@@ -311,12 +343,12 @@ def phase_api_renewal(use_cookies=None):
         return True
 
     except requests.exceptions.RequestException as e:
-        log.error("API request error: %e", e)
+        log.error("API request error: %s", e)
         report["error"] = f"API request failed: {str(e)}"
         _report(report)
         return False
     except Exception as e:
-        log.error("API renewal failed unexpectedly: %e", e)
+        log.error("API renewal failed unexpectedly: %s", e)
         report["error"] = str(e)
         _report(report)
         return False
@@ -376,7 +408,7 @@ def main():
             if not cookies:
                 raise ValueError("No cookies found in session secret")
         except Exception as e:
-            log.error("Failed to parse ZAMPTO_SESSION_SECRET: %e", e)
+            log.error("Failed to parse ZAMPTO_SESSION_SECRET: %s", e)
             push_tg("🚨 Session Error", f"Cannot decode ZAMPTO_SESSION_SECRET: {str(e)}")
             cookies = None  # fall through to fail cleanly
 
