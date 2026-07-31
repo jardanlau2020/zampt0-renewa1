@@ -605,6 +605,15 @@ def phase_api_renewal(use_cookies=None):
                 log.warning("No expiry field in API response")
 
         _report(report)
+        # If captcha is required, treat as informational (not failure)
+        # User has a userscript for manual/semi-auto renewal via browser
+        if report.get("error") and "captcha" in str(report["error"]).lower():
+            log.info("ℹ️ Captcha required - please use the userscript in your browser to renew")
+            log.info("    The script will continue to monitor and send Telegram reminders")
+            # Don't fail - this is expected behavior
+            report["action"] = "manual_renewal_required"
+            report["error"] = None
+            _report(report)
         return True
 
     except requests.exceptions.RequestException as e:
@@ -625,6 +634,7 @@ def _report(report):
         "started": "\u25B6\ufe0f", "renewed": "\U0001F504", "skipped": "\u23ED\ufe0f",
         "renew-failed": "\u26A0\ufe0f", "none": "\U0001F4CB",
         "start-failed": "\u2753", "login-failed": "\U0001F512",
+        "manual_renewal_required": "\U0001F514",
     }
     body = (
         f"\U0001F5A5\ufe0f **Zampto Server Report**\n\n"
@@ -636,6 +646,13 @@ def _report(report):
         body += f"\n**Expiry:** {report['expiry']}"
     if report.get("error"):
         body += f"\n**⚠️ Error:** {report['error']}"
+    # Special reminder for manual renewal required
+    if report.get("action") == "manual_renewal_required":
+        body += (
+            f"\n\n\u0001F514 **请手动续期**\n"
+            f"API 续期被 captcha 拦截，请在浏览器中打开 Zampto Dashboard\n"
+            f"使用油猴脚本或手动点击 Renew Server 按钮。"
+        )
     body += f"\n\n_Generated: {report['timestamp']}_"
 
     log.info("--- Report ---\n%s", body)
