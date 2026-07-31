@@ -546,107 +546,57 @@ def phase_api_renewal(use_cookies=None):
                 if should_renew:
                     log.info("Renewing server (%d h left, threshold: 48h)", total_h)
                     renewed = False
-                    # Path list - put the confirmed correct one first
-                    # User confirmed: POST /api/server/renew (singular, no ID in URL)
-                    # Body should contain server_id
-                    renew_paths = []
-                    if server_identifier:
-                        renew_paths.append(f"/api/client/servers/{server_identifier}/renew")
-                    renew_paths.extend([
-                        "/api/server/renew",                  # ← confirmed correct path (POST with body)
-                        f"/api/servers/{SERVER_ID}/renew",
-                        f"/api/server/{SERVER_ID}/renew",
-                        f"{used_path}/renew",
-                        f"/api/servers/renew",
-                        f"/api/renew",
-                    ])
-                    for renew_path in renew_paths:
-                        renew_url = f"{DASHBOARD_URL}{renew_path}"
-                        log.info("  Trying renew endpoint: %s", renew_path)
+                    # Confirmed correct endpoint: POST /api/server/renew
+                    # Body field name unknown - try multiple variants
+                    # Note: server may also require captcha (cf-turnstile-response)
+                    renew_url = f"{DASHBOARD_URL}/api/server/renew"
 
-                        # Fetch fresh CSRF right before each POST
+                    # Try multiple body shapes - the API said "Invalid server ID"
+                    # so we need to find the correct field name
+                    body_variants = [
+                        {"server_id": int(SERVER_ID) if SERVER_ID.isdigit() else SERVER_ID},
+                        {"id": int(SERVER_ID) if SERVER_ID.isdigit() else SERVER_ID},
+                        {"serverId": int(SERVER_ID) if SERVER_ID.isdigit() else SERVER_ID},
+                        {"server": int(SERVER_ID) if SERVER_ID.isdigit() else SERVER_ID},
+                        {"sid": int(SERVER_ID) if SERVER_ID.isdigit() else SERVER_ID},
+                        {"server_id": SERVER_ID},  # string form
+                        {"id": SERVER_ID},  # string form
+                    ]
+
+                    for body in body_variants:
+                        log.info("  Trying /api/server/renew with body: %s", body)
                         fresh_csrf = refresh_csrf_token(api_session)
                         if not fresh_csrf:
-                            log.warning("  Could not refresh CSRF, skipping this path")
                             continue
+                        try:
+                            resp = api_session.post(
+                                renew_url,
+                                json=body,
+                                timeout=15,
+                                headers={"X-CSRF-Token": fresh_csrf},
+                            )
+                            ct = resp.headers.get("content-type", "")
+                            is_json = "json" in ct.lower()
+                            log.info("    -> %d %s body=%s",
+                                     resp.status_code, "JSON" if is_json else "HTML",
+                                     resp.text[:200])
 
-                        # Body should include server_id for paths that don't have it in URL
-                        # (especially /api/server/renew which is the confirmed correct path)
-                        post_body = {}
-                        if renew_path in ("/api/server/renew", "/api/servers/renew", "/api/renew"):
-                            post_body = {"server_id": int(SERVER_ID) if SERVER_ID.isdigit() else SERVER_ID}
-                            log.info("  POST body: %s", post_body)
-                        resp = api_session.post(
-                            renew_url,
-                            json=post_body,
-                            timeout=15,
-                            headers={"X-CSRF-Token": fresh_csrf},
-                        )
-                        if resp.status_code in [200, 201, 204, 202]:
-                            report["action"] = "renewed"
-                            log.info("  ✓ Renewal successful (status %d)", resp.status_code)
-                            renewed = True
-                            break
-                        else:
-                            log.warning("  Renew failed at %s: %d %s", renew_path, resp.status_code, resp.text[:200])
-                    if not renewed:
-                        # Diagnostic: probe many renew endpoint variants and log results
-                        # This helps identify the correct path
-                        log.warning("  All renew paths failed. Running diagnostic probe...")
-                        diag_paths = [
-                            f"/api/server/{SERVER_ID}/renew",
-                            f"/api/servers/{SERVER_ID}/renew",
-                            f"/api/server/{server_identifier}/renew" if server_identifier else None,
-                            f"/api/servers/{server_identifier}/renew" if server_identifier else None,
-                            "/api/server/renew",
-                            "/api/servers/renew",
-                            "/api/renew",
-                            "/api/sidebar/renew",
-                            "/api/server/renewal",
-                            "/api/servers/renewal",
-                            "/api/server/extend",
-                            "/api/servers/extend",
-                            "/api/renewal",
-                            f"/api/server/{SERVER_ID}/extend",
-                            # Try POST with different methods
-                            f"/api/server/{SERVER_ID}",
-                            f"/api/servers/{SERVER_ID}",
-                            # PUT method on resource
-                            f"/api/server/{SERVER_ID}/renew",
-                        ]
-                        # Also try with the actual identifier (short UUID)
-                        if server_identifier:
-                            diag_paths.extend([
-                                f"/api/client/servers/{server_identifier}",
-                                f"/api/client/servers/{server_identifier}/renew",
-                                f"/api/client/servers/{server_identifier}/power",
-                            ])
+                            if resp.status_code in [200, 201, 204, 202]:
+                                report["action"] = "renewed"
+                                log.info("  ✓ Renewal successful (status %d, body=%s)", resp.status_code, body)
+                                renewed = True
+                                break
+                            # If response says "Invalid server ID", try next variant
+                            # If response says "captcha", we have a different problem
+                            if "captcha" in resp.text.lower() or "verification" in resp.text.lower():
+                                log.warning("    API requires captcha - cannot auto-renew without solving Turnstile")
+                                report["error"] = "Captcha required: " + resp.text[:200]
+                                break  # Don't try more variants, captcha is the blocker
+                        except Exception as e:
+                            log.warning("    Request failed: %s", e)
 
-                        for diag_path in diag_paths:
-                            if not diag_path:
-                                continue
-                            diag_url = f"{DASHBOARD_URL}{diag_path}"
-                            fresh_csrf = refresh_csrf_token(api_session)
-                            try:
-                                # Try POST first
-                                r = api_session.post(
-                                    diag_url,
-                                    json={"server_id": SERVER_ID, "id": SERVER_ID},
-                                    timeout=10,
-                                    headers={"X-CSRF-Token": fresh_csrf or ""},
-                                )
-                                ct = r.headers.get("content-type", "")
-                                is_json = "json" in ct.lower()
-                                if r.status_code == 404 and not is_json:
-                                    log.info("    [POST 404 HTML] %s", diag_path)
-                                else:
-                                    log.info("    [POST %d %s] %s body=%s",
-                                             r.status_code, "JSON" if is_json else "HTML",
-                                             diag_path, r.text[:150])
-                            except Exception as e:
-                                log.warning("    [POST ERR] %s: %s", diag_path, e)
-
-                        report["error"] = "Renewal failed on all probed endpoints (see diagnostic logs above)"
+                    if not renewed and not report.get("error"):
+                        report["error"] = "Renewal failed - could not find correct body format"
                 else:
                     report["action"] = "skipped"
                     log.info("Not renewing - %d hours remaining (threshold: 48)", total_h)
