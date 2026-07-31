@@ -86,45 +86,46 @@ def main():
         time.sleep(5)
         snap(page, "01_login.png")
 
-        # --- STEP 2: Inject Turnstile mock + capture onToken callback ---
-        # The JS code creates a TurnstileWidget that calls onToken callback
-        # when turnstile.render() succeeds. We mock turnstile.render to
-        # immediately call the callback with a fake but plausible token.
-        inject_turnstile_mock = f"""
-        (function() {{
-          var device_id = '{device_id}';
-          localStorage.setItem('zampto_device_id', device_id);
+        # --- STEP 2: Inject Turnstile mock BEFORE page loads ---
+        # CRITICAL: use add_init_script so mock exists before React useEffect runs
+        # The JS code checks window.turnstile and calls render() immediately on mount.
+        # If mock isn't there, Turnstile renders in "error" state and never recovers.
+        inject_turnstile_mock = """
+        (function() {
+          // Generate a fake but valid-format Turnstile token
+          var ts = new Date().getTime().toString();
+          var id = 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+            var r = Math.random() * 16 | 0;
+            var v = c === 'x' ? r : (r & 0x3 | 0x8);
+            return v.toString(16);
+          });
+          var raw = JSON.stringify({ host: location.hostname, ts: Date.now(), id: id });
+          var token = '0.' + btoa(raw).replace(/\\+/g, '-').replace(/\\//g, '_').replace(/=/g, '');
 
-          // Pre-create Turnstile mock before the app JS loads
-          window.turnstile = {{
-            render: function(el, opts) {{
-              // Call onToken immediately with a fake token
-              if (opts && opts.callback) {{
-                var token = '0.' + btoa(JSON.stringify({{
-                  host: location.hostname,
-                  ts: Date.now(),
-                  id: device_id
-                }})).replace(/\\+/g, '-').replace(/\\//g, '_').replace(/=/g, '');
+          // Mock turnstile API before any page JS runs
+          window.turnstile = {
+            render: function(el, opts) {
+              if (opts && typeof opts.callback === 'function') {
                 opts.callback(token);
-                return token;
-              }}
-              return null;
-            }},
-            reset: function() {{}},
-            remove: function() {{}}
-          }};
-          window.__zampto_injected_turnstile = true;
-          console.log('Turnstile mock injected');
-        }})();
+              }
+              return token;
+            },
+            reset: function() {},
+            remove: function() {}
+          };
+
+          // Also store in localStorage for deviceId header
+          try { localStorage.setItem('zampto_device_id', id); } catch(e) {}
+
+          window.__zampto_mocked = true;
+          console.log('[ZAMPTO] Turnstile mock injected, token prefix: 0.' + token.slice(2, 20) + '...');
+        })();
         """
         try:
-            page.evaluate(inject_turnstile_mock)
-            log.info("Turnstile mock injected")
+            page.add_init_script(inject_turnstile_mock)
+            log.info("Turnstile mock registered via add_init_script")
         except Exception as e:
-            log.warning("Inject mock failed: %s", e)
-
-        # Give page JS time to initialize and render Turnstile
-        time.sleep(3)
+            log.warning("add_init_script failed: %s", e)
 
         # --- STEP 3: Fill form and submit ---
         log.info("Filling login form...")
@@ -154,41 +155,50 @@ def main():
 
         # --- STEP 4: Direct API login via page.evaluate (bypasses form submit) ---
         log.info("Attempting direct API login via page.evaluate...")
-        api_login_js = f"""
-        (function() {{
+        api_login_js = """
+        (function() {
           var token = '';
-          // Try to get turnstile token from various sources
-          if (window.turnstile && window.turnstile.token) {{
+          // Try to get turnstile token from window.turnstile mock
+          if (window.turnstile && window.turnstile.token) {
             token = window.turnstile.token;
-          }}
+          }
           // If no token, generate one
-          if (!token) {{
+          if (!token) {
             var d = new Date().getTime();
             token = '0.' + btoa(d.toString() + Math.random().toString(36)).replace(/\\+/g,'-').replace(/\\//g,'_').replace(/=/g,'');
-          }}
-          return fetch('{DASHBOARD_URL}/api/auth/login', {{
+          }
+          // Get device id from localStorage
+          var deviceId = localStorage.getItem('zampto_device_id') || '';
+          if (!deviceId) {
+            deviceId = 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+              var r = Math.random() * 16 | 0;
+              var v = c === 'x' ? r : (r & 0x3 | 0x8);
+              return v.toString(16);
+            });
+          }
+          return fetch('""" + DASHBOARD_URL + """' + "/api/auth/login", {
             method: 'POST',
-            headers: {{
+            headers: {
               'Content-Type': 'application/json',
-              'x-device-id': '{device_id}'
-            }},
-            body: JSON.stringify({{
-              email: '{USERNAME}',
-              password: '{PASSWORD}',
+              'x-device-id': deviceId
+            },
+            body: JSON.stringify({
+              email: '""" + USERNAME + """',
+              password: '""" + PASSWORD + """',
               turnstile_token: token
-            }})
-          }}).then(function(r) {{
-            return r.text().then(function(t) {{
-              return JSON.stringify({{
+            })
+          }).then(function(r) {
+            return r.text().then(function(t) {
+              return JSON.stringify({
                 status: r.status,
                 location: r.headers.get('location') || '',
                 body: t.substring(0, 800)
-              }});
-            }});
-          }}).catch(function(e) {{
-            return JSON.stringify({{status: -1, error: e.message}});
-          }});
-        }})();
+              });
+            });
+          }).catch(function(e) {
+            return JSON.stringify({status: -1, error: e.message});
+          });
+        })();
         """
         result = page.evaluate(api_login_js)
         log.info("API login result: %s", result[:500])
