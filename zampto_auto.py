@@ -185,6 +185,28 @@ def main():
                 log.info("Turnstile widget found, waiting for CloakBrowser to auto-solve...")
                 time.sleep(15)  # Extended wait for Turnstile auto-solution
 
+            # ── Debug: check if Turnstile is in iframe ─────────────────
+            log.info("[DEBUG] Searching for Turnstile-related elements in page...")
+            iframes = page.query_selector_all("iframe")
+            log.info("Found %d iframes on page", len(iframes))
+            for idx, iframe in enumerate(iframes):
+                src = iframe.get_attribute("src") or ""
+                log.info("  iframe[%d]: src=%s", idx, src)
+
+            # Search HTML for Turnstile keywords
+            for keyword in ["cf-turnstile", "data-sitekey", "turnstile", "security-verify", "cloudflare"]:
+                count = page.content().lower().count(keyword)
+                log.info("  HTML keyword '%s' appears %d times", keyword, count)
+
+            # Try to find Turnstile hidden input (might be pre-solved)
+            turnstile_token = page.query_selector("input[name='cf_turnstile'], input[name='turnstile'], input[class*='turnstile']")
+            if turnstile_token:
+                val = turnstile_token.get_attribute("value") or ""
+                log.info("Found Turnstile token input: %s...", val[:40])
+                report["turnstile_token"] = val[:40]
+            else:
+                log.info("No Turnstile token input found")
+
             # ── Step F: Check result ───────────────────────────────────
             time.sleep(3)
             page.wait_for_load_state("domcontentloaded", timeout=20000)
@@ -196,15 +218,15 @@ def main():
             log.info("Post-login text: %s", post_login_text)
 
             # Dump full HTML for debugging
-            html_debug = page.content()
-            log.info("[DEBUG] Full HTML length: %d chars", len(html_debug))
+            page_html = page.content()
+            log.info("[DEBUG] Full HTML length: %d chars", len(page_html))
 
             if "login" in post_login_url.lower() or "Welcome Back" in post_login_text or "security verification" in post_login_text:
                 log.warning("Login failed — still on login page. Dumping relevant HTML sections...")
                 screenshot(page, "03_login_failed.png")
 
                 # Check if Turnstile was marked as solved
-                turnstile_solved = "[x]" in html_debug.lower() or "solved" in html_debug.lower()
+                turnstile_solved = "[x]" in page_html.lower() or "solved" in page_html.lower()
                 log.info("Turnstile appears solved in HTML: %s", turnstile_solved)
 
                 # Check for error messages
@@ -231,7 +253,10 @@ def main():
                     log.error("Login FAILED after 2 attempts. Screenshot: 03_post_login_retry.png")
                     report["error"] = "Login failed — Turnstile verification could not be completed in headless mode"
                     screenshot(page, "07_final.png")
-                    browser.close()
+                    try:
+                        browser.close()
+                    except Exception:
+                        pass  # Event loop may already be stopped
                     push_tg("🖥️ Zampto Server Report", (
                         f"🖥️ **Zampto Server Report**\n\n"
                         f"**Server ID:** `{SERVER_ID}`\n"
