@@ -605,6 +605,14 @@ def phase_api_renewal(use_cookies=None):
                 log.warning("No expiry field in API response")
 
         _report(report)
+        # Return False (non-zero exit) if renewal was required but failed
+        # This triggers the browser-based fallback in the workflow
+        if report.get("error") and "captcha" in str(report["error"]).lower():
+            log.warning("Returning non-zero exit due to captcha - workflow will try browser fallback")
+            return False
+        if report.get("error") and "Renewal failed" in str(report["error"]):
+            log.warning("Returning non-zero exit due to renewal failure - workflow will try browser fallback")
+            return False
         return True
 
     except requests.exceptions.RequestException as e:
@@ -708,7 +716,11 @@ def main():
             log.info("Tip: Run again without interactive mode to save session for future automated runs")
     else:
         log.error("✗ Renewal failed - check session validity and API endpoints")
-        push_tg("🔴 Renewal Failed", "Authentication succeeded but renewal operation failed. Check session expiration.")
+        # Don't send TG here - workflow will fallback to browser mode and send result
+        # Only send TG if NOT in github actions (no fallback available)
+        if not is_github_actions:
+            push_tg("🔴 Renewal Failed", "Authentication succeeded but renewal operation failed. Check session expiration.")
+        sys.exit(1)  # Non-zero exit triggers browser fallback in workflow
 
 
 if __name__ == "__main__":
