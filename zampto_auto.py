@@ -176,39 +176,61 @@ def main():
                 log.info("Login button not found, pressing Enter on password field")
                 pwd_input.press("Enter")
 
-            # ── Step E: Wait for Turnstile iframe + auto-solve ─────────
-            log.info("Waiting for Turnstile iframe to appear and auto-solve...")
-            time.sleep(3)
-            turnstile_found = wait_for(page, "iframe[src*='turnstile'], [class*='turnstile'], [data-sitekey], text=/Please complete/i",
-                                       60, "Turnstile widget")
-            if turnstile_found:
-                log.info("Turnstile widget found, waiting for CloakBrowser to auto-solve...")
-                time.sleep(15)  # Extended wait for Turnstile auto-solution
+            # ── Step E: Find & solve Turnstile inside iframe ──────────
+            log.info("Searching for Turnstile iframe...")
+            time.sleep(2)
 
-            # ── Debug: check if Turnstile is in iframe ─────────────────
-            log.info("[DEBUG] Searching for Turnstile-related elements in page...")
-            iframes = page.query_selector_all("iframe")
-            log.info("Found %d iframes on page", len(iframes))
-            for idx, iframe in enumerate(iframes):
-                src = iframe.get_attribute("src") or ""
-                log.info("  iframe[%d]: src=%s", idx, src)
+            # Find the Cloudflare Turnstile iframe (src="" means srcdoc)
+            turnstile_frame = None
+            all_frames = page.frames()
+            for f in all_frames:
+                src = f.get_attribute("src") or ""
+                url = f.url or ""
+                log.info("  frame url=%s src=%s", url, src)
+                if "turnstile" in url.lower() or "cloudflare" in url.lower() or "cf-turnstile" in url.lower():
+                    log.info("  >>> Turnstile frame found: url=%s", url)
+                    turnstile_frame = f
+                    break
 
-            # Search HTML for Turnstile keywords
-            for keyword in ["cf-turnstile", "data-sitekey", "turnstile", "security-verify", "cloudflare"]:
-                count = page.content().lower().count(keyword)
-                log.info("  HTML keyword '%s' appears %d times", keyword, count)
+            # If no Turnstile frame found, try clicking the iframe element directly
+            if not turnstile_frame:
+                log.info("No Turnstile frame detected, trying to interact with Turnstile via page...")
+                # Try clicking the Turnstile checkbox area
+                turnstile_checkbox = page.query_selector(
+                    "[class*='challenge-container'], [class*='cloudflare'], "
+                    "[class*='cf-turnstile'], .cf-turnstile, "
+                    "[data-turnstile], .turnstile-badge, "
+                    "[class*='security-verify'], [class*='verification']")
+                if turnstile_checkbox:
+                    log.info("Found potential Turnstile element, clicking...")
+                    turnstile_checkbox.click()
+                    time.sleep(5)
 
-            # Try to find Turnstile hidden input (might be pre-solved)
-            turnstile_token = page.query_selector("input[name='cf_turnstile'], input[name='turnstile'], input[class*='turnstile']")
-            if turnstile_token:
-                val = turnstile_token.get_attribute("value") or ""
-                log.info("Found Turnstile token input: %s...", val[:40])
-                report["turnstile_token"] = val[:40]
-            else:
-                log.info("No Turnstile token input found")
+                # Alternative: try clicking the iframe itself
+                cf_iframe = page.query_selector("iframe[src=''], iframe[srcdoc]")
+                if cf_iframe:
+                    log.info("Found empty-src iframe, attempting frame access...")
+                    try:
+                        cf_frame = cf_iframe.content_frame()
+                        if cf_frame:
+                            log.info("Got content_frame from empty-src iframe")
+                            # Try to find and click the checkbox
+                            checkbox = cf_frame.query_selector(
+                                "[class*='checkbox'], [role='checkbox'], "
+                                "input[type='checkbox'], .cf-turnstile-box, "
+                                "[class*='challenge']")
+                            if checkbox:
+                                log.info("Found Turnstile checkbox in iframe, clicking...")
+                                checkbox.click()
+                                time.sleep(10)
+                            else:
+                                log.info("No checkbox found in iframe, dumping frame content...")
+                                log.info("  frame text: %s", cf_frame.text_content()[:200])
+                    except Exception as e:
+                        log.warning("Failed to access Turnstile iframe: %s", e)
 
             # ── Step F: Check result ───────────────────────────────────
-            time.sleep(3)
+            time.sleep(5)
             page.wait_for_load_state("domcontentloaded", timeout=20000)
             screenshot(page, "03_post_login.png")
 
@@ -222,50 +244,72 @@ def main():
             log.info("[DEBUG] Full HTML length: %d chars", len(page_html))
 
             if "login" in post_login_url.lower() or "Welcome Back" in post_login_text or "security verification" in post_login_text:
-                log.warning("Login failed — still on login page. Dumping relevant HTML sections...")
+                log.warning("Login failed — still on login page.")
                 screenshot(page, "03_login_failed.png")
 
-                # Check if Turnstile was marked as solved
-                turnstile_solved = "[x]" in page_html.lower() or "solved" in page_html.lower()
-                log.info("Turnstile appears solved in HTML: %s", turnstile_solved)
+                # Check if Turnstile token appeared (solved)
+                solved = "solved" in page_html.lower() or "cf_turnstile" in page_html.lower()
+                log.info("Turnstile solved indicator in HTML: %s", solved)
 
-                # Check for error messages
-                if "invalid" in post_login_text.lower() or "incorrect" in post_login_text.lower() or "error" in post_login_text.lower():
-                    log.error("Login rejected: %s", post_login_text[:200])
-                elif "security verification" in post_login_text.lower():
-                    log.warning("Turnstile not solved — Cloudflare verification pending")
+                # Check for specific error messages
+                lower_text = post_login_text.lower()
+                if "invalid" in lower_text or "incorrect" in lower_text:
+                    log.error("Credentials rejected: %s", post_login_text[:200])
+                elif "security verification" in lower_text:
+                    log.warning("Turnstile still pending")
+                    # Last resort: try clicking the iframe with longer waits
+                    for attempt in range(3):
+                        log.info("Turnstile retry attempt %d...", attempt + 1)
+                        cf_iframe = page.query_selector("iframe[src=''], iframe[srcdoc]")
+                        if cf_iframe:
+                            try:
+                                cf_frame = cf_iframe.content_frame()
+                                if cf_frame:
+                                    checkbox = cf_frame.query_selector(
+                                        "[class*='checkbox'], [role='checkbox'], "
+                                        "input[type='checkbox'], .cf-turnstile-box")
+                                    if checkbox:
+                                        checkbox.click()
+                                        time.sleep(8)
+                                        login_btn.click()
+                                        time.sleep(8)
+                                        page.wait_for_load_state("domcontentloaded", timeout=20000)
+                                        screenshot(page, f"03_retry_{attempt + 1}.png")
+                                        url = page.url
+                                        text = page.inner_text("body")[:200]
+                                        log.info("  URL: %s | Text: %s", url, text)
+                                        if "login" not in url.lower() and "Welcome Back" not in text:
+                                            log.info("Login SUCCESS after Turnstile retry!")
+                                            screenshot(page, "03_login_success.png")
+                                            break
+                                    else:
+                                        log.info("  No checkbox in iframe")
+                            except Exception as e:
+                                log.warning("  Retry %d failed: %s", attempt + 1, e)
+                        else:
+                            log.info("  No Turnstile iframe found")
+                        time.sleep(3)
 
-                # Try again with even longer Turnstile wait
-                log.info("Retry: waiting longer for Turnstile...")
-                time.sleep(20)
-                if login_btn:
-                    login_btn.click()
-                    time.sleep(20)
-                page.wait_for_load_state("domcontentloaded", timeout=20000)
-                screenshot(page, "03_post_login_retry.png")
-
-                post_login_url2 = page.url
-                post_login_text2 = page.inner_text("body")[:300]
-                log.info("Post-login URL (retry): %s", post_login_url2)
-                log.info("Post-login text (retry): %s", post_login_text2)
-
-                if "login" in post_login_url2.lower() or "Welcome Back" in post_login_text2:
-                    log.error("Login FAILED after 2 attempts. Screenshot: 03_post_login_retry.png")
-                    report["error"] = "Login failed — Turnstile verification could not be completed in headless mode"
-                    screenshot(page, "07_final.png")
-                    try:
-                        browser.close()
-                    except Exception:
-                        pass  # Event loop may already be stopped
-                    push_tg("🖥️ Zampto Server Report", (
-                        f"🖥️ **Zampto Server Report**\n\n"
-                        f"**Server ID:** `{SERVER_ID}`\n"
-                        f"**Status:** 🔴 Failed\n"
-                        f"**Action:** ❌ login-failed\n"
-                        f"**⚠️ Error:** Login failed — Turnstile verification could not be completed.\n"
-                        f"Please check `03_post_login_retry.png` in Artifacts for details.\n\n"
-                        f"_Generated: {datetime.now(timezone.utc).isoformat()}_"))
-                    return
+                    # Final check
+                    post_login_url2 = page.url
+                    post_login_text2 = page.inner_text("body")[:300]
+                    if "login" in post_login_url2.lower() or "Welcome Back" in post_login_text2:
+                        log.error("Login FAILED after all Turnstile attempts.")
+                        report["error"] = "Login failed — Turnstile in srcdoc iframe cannot be solved"
+                        screenshot(page, "07_final.png")
+                        try:
+                            browser.close()
+                        except Exception:
+                            pass
+                        push_tg("🖥️ Zampto Server Report", (
+                            f"🖥️ **Zampto Server Report**\n\n"
+                            f"**Server ID:** `{SERVER_ID}`\n"
+                            f"**Status:** 🔴 Failed\n"
+                            f"**Action:** ❌ login-failed\n"
+                            f"**⚠️ Error:** Turnstile (Cloudflare) in srcdoc iframe cannot be solved in headless mode.\n"
+                            f"Suggestion: add a Turnstile bypass or switch to API-based login.\n\n"
+                            f"_Generated: {datetime.now(timezone.utc).isoformat()}_"))
+                        return
             else:
                 log.info("Login SUCCESS! Dashboard loaded.")
                 screenshot(page, "03_login_success.png")
@@ -442,7 +486,10 @@ def main():
         log.exception("Automation failed: %s", e)
     finally:
         if browser:
-            browser.close()
+            try:
+                browser.close()
+            except Exception:
+                pass  # Event loop may already be stopped
 
     # ── 8. Build & send notification ────────────────────────────────────
     status_icon = "🟢" if report["status"] == "running" else "🔴"
