@@ -93,7 +93,7 @@ jobs:
             sleep 2
           fi
 
-          python zampto_auto.py || echo "Script exited: $?"
+          python zampto_auto.py
 
           sleep 2
           [ -n "$RECORD_PID" ] && kill $RECORD_PID 2>/dev/null
