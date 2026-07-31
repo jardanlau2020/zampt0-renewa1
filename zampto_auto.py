@@ -360,13 +360,14 @@ def main():
     log.info("=== Zampto Auto Renewal v5 ===")
     log.info("Server ID: %s | Force: %s", SERVER_ID, FORCE_RENEW)
 
-    # ── Check for HEADLESS/GITHUB MODE ────────
+    # ── Determine mode: GitHub (pure API) or Local (hybrid) ────────
     is_github_actions = bool(os.getenv("GITHUB_ACTION") or os.getenv("CI"))
     session_secret = os.getenv("ZAMPTO_SESSION_SECRET")
+    cookies = None
 
+    # Mode A: GitHub Actions – pure API via ZAMPTO_SESSION_SECRET
     if is_github_actions and session_secret:
         log.info("=== GITHUB ACTIONS MODE: Pure API, no browser ===")
-        # Decode session from secret (base64-encoded JSON)
         try:
             decoded = base64.b64decode(session_secret).decode("utf-8")
             session_data = json.loads(decoded)
@@ -375,50 +376,42 @@ def main():
             if not cookies:
                 raise ValueError("No cookies found in session secret")
         except Exception as e:
-            log.error("Failed to parse session secret: %e", e)
+            log.error("Failed to parse ZAMPTO_SESSION_SECRET: %e", e)
             push_tg("🚨 Session Error", f"Cannot decode ZAMPTO_SESSION_SECRET: {str(e)}")
-            # Also check if we have a saved file as fallback
-            cookies = load_session()
-            if not cookies:
-                log.error("No session available - cannot proceed in API-only mode")
-                return
-    else:
-        # Local/dev mode: try saved session file first
+            cookies = None  # fall through to fail cleanly
+
+    # Mode B: Local dev – try saved session file
+    elif not is_github_actions:
         cookies = load_session()
         if cookies:
-            log.info("Session file found. Using API-based renewal...")
-            success = phase_api_renewal(use_cookies=cookies)
-            if success:
-                log.info("Completed with saved session file")
-                return
-            else:
-                log.warn("Session file failed, falling back to browser login")
+            log.info("Found session file, using API mode directly")
+        else:
+            log.info("No session file found - will use interactive login")
 
-    # Fallback: Interactive browser login (only for local development)
-    if not is_github_actions:
-        log.info("\n=== LOCAL MODE: No valid session found, starting interactive browser login ===")
-        log.info("IMPORTANT: A browser window will open on your desktop.")
-        log.info("Please complete the Turnstile CAPTCHA manually when it appears.")
-        log.info("After successful login, the script will continue automatically.\n")
-        try:
-            input("Press Enter after the browser window appears and you're ready to log in...")
-            phase_browser_login_interactive()
-        except KeyboardInterrupt:
-            log.info("Login interrupted by user")
-            return
-        except Exception as e:
-            log.error("Browser login failed: %e", e)
-            push_tg("🚨 Login Failed", str(e))
-            return
+    # Mode C: No session available – FAIL (GitHub should have secret)
+    if not cookies:
+        log.error("No valid authentication available - cannot proceed")
+        reason = "Missing ZAMPTO_SESSION_SECRET (GitHub) OR missing ./screenshots/session.json (local)"
+        push_tg("🚨 Authentication Error", reason)
+        report = {
+            "server_id": SERVER_ID, "status": "unknown", "action": "none",
+            "expiry": None, "error": reason,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        _report(report)
+        return
 
-    # After browser login, always try API mode next
-    time.sleep(2)
-    success = phase_api_renewal(use_cookies=(cookies or []))
+    # Execute API renewal with the loaded cookies
+    log.info("Starting API-based server status check & renewal...")
+    success = phase_api_renewal(use_cookies=cookies)
+
     if success:
         log.info("✓ Renewal completed successfully!")
+        if not is_github_actions:
+            log.info("Tip: Run again without interactive mode to save session for future automated runs")
     else:
-        log.error("✗ Renewal failed despite session")
-        push_tg("🔴 Renewal Failed", f"Could not renew server. Check logs and session validity.")
+        log.error("✗ Renewal failed - check session validity and API endpoints")
+        push_tg("🔴 Renewal Failed", "Authentication succeeded but renewal operation failed. Check session expiration.")
 
 
 if __name__ == "__main__":
