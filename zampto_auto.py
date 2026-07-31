@@ -180,13 +180,12 @@ def main():
             log.info("Searching for Turnstile iframe...")
             time.sleep(2)
 
-            # Find the Cloudflare Turnstile iframe (src="" means srcdoc)
+            # Find the Cloudflare Turnstile iframe
             turnstile_frame = None
-            all_frames = page.frames()
+            all_frames = page.frames
             for f in all_frames:
-                src = f.get_attribute("src") or ""
                 url = f.url or ""
-                log.info("  frame url=%s src=%s", url, src)
+                log.info("  frame url=%s", url)
                 if "turnstile" in url.lower() or "cloudflare" in url.lower() or "cf-turnstile" in url.lower():
                     log.info("  >>> Turnstile frame found: url=%s", url)
                     turnstile_frame = f
