@@ -73,6 +73,7 @@ jobs:
           ZAMPTO_USERNAME: ${{ secrets.ZAMPTO_USERNAME }}
           ZAMPTO_PASSWORD: ${{ secrets.ZAMPTO_PASSWORD }}
           ZAMPTO_SERVER_ID: ${{ secrets.ZAMPTO_SERVER_ID }}
+          ZAMPTO_SESSION_SECRET: ${{ secrets.ZAMPTO_SESSION_SECRET }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           FORCE_RENEW: ${{ github.event.inputs.force_renew || 'false' }}
