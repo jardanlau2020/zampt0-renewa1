@@ -200,29 +200,7 @@ jobs:
           fi
 
           python zampto_auto.py
-          API_EXIT=$?
-          echo "API script exit code: $API_EXIT"
-
-          # If API renewal failed due to captcha, fallback to browser-based renewal
-          # The API script logs "Captcha required" when this happens
-          if [ $API_EXIT -ne 0 ]; then
-            echo "=== API renewal failed, trying browser-based fallback ==="
-
-            # Re-enable proxy env for browser (it was set by TUIC step earlier, still active)
-            echo "ALL_PROXY=socks5h://127.0.0.1:1080" >> $GITHUB_ENV
-            echo "HTTP_PROXY=socks5h://127.0.0.1:1080" >> $GITHUB_ENV
-            echo "HTTPS_PROXY=socks5h://127.0.0.1:1080" >> $GITHUB_ENV
-
-            # Run browser-based renewal (uses cloakbrowser + userscript)
-            python zampto_browser_renew.py
-            BROWSER_EXIT=$?
-            echo "Browser script exit code: $BROWSER_EXIT"
-
-            # Use browser's exit code as final result
-            PYTHON_EXIT=$BROWSER_EXIT
-          else
-            PYTHON_EXIT=0
-          fi
+          PYTHON_EXIT=$?
 
           sleep 2
           [ -n "$RECORD_PID" ] && kill $RECORD_PID 2>/dev/null
