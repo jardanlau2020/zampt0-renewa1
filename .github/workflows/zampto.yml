@@ -92,46 +92,75 @@ jobs:
           echo "  Insecure: $INSECURE"
           echo "  ALPN:   $ALPN"
 
-          echo "[2/4] Downloading tuic-client ..."
-          # Use EAimTY/tuic (TUIC v5 reference client)
-          curl -sL "https://github.com/EAimTY/tuic/releases/latest/download/tuic-client-x86_64-unknown-linux-gnu" -o /tmp/tuic
-          chmod +x /tmp/tuic
-          /tmp/tuic --version || true
+          echo "[2/4] Downloading sing-box (supports TUIC v5 client) ..."
+          # Use sing-box - widely used, stable, supports TUIC v5 inbound+outbound
+          SB_VERSION="1.10.7"
+          SB_URL="https://github.com/SagerNet/sing-box/releases/download/v${SB_VERSION}/sing-box-${SB_VERSION}-linux-amd64.tar.gz"
+          echo "  URL: $SB_URL"
+          curl -fSL "$SB_URL" -o /tmp/sb.tar.gz
+          tar -xzf /tmp/sb.tar.gz -C /tmp/
+          mv /tmp/sing-box-${SB_VERSION}-linux-amd64/sing-box /tmp/sing-box
+          chmod +x /tmp/sing-box
 
-          echo "[3/4] Writing TUIC client config ..."
-          cat > /tmp/tuic_client.json <<EOF
+          # Verify it's actually an ELF binary
+          FILE_TYPE=$(file /tmp/sing-box 2>/dev/null || echo "unknown")
+          echo "  File type: $FILE_TYPE"
+          if ! echo "$FILE_TYPE" | grep -q "ELF"; then
+            echo "[ERROR] sing-box binary is not valid ELF"
+            exit 1
+          fi
+          /tmp/sing-box version
+
+          echo "[3/4] Writing sing-box config ..."
+          cat > /tmp/sb_config.json <<EOF
           {
-            "server": "$SERVER:$PORT",
-            "uuid": "$UUID",
-            "password": "$PASSWORD",
-            "tls": {
-              "server_name": "$SNI",
-              "alpn": ["$ALPN"],
-              "dangerous_accept_invalid_certs": $([ "$INSECURE" = "1" ] && echo true || echo false)
-            },
-            "socks5": {
-              "listen": "127.0.0.1:1080"
-            },
-            "log_level": "info"
+            "log": { "level": "info", "timestamp": true },
+            "inbounds": [
+              {
+                "type": "socks",
+                "tag": "socks-in",
+                "listen": "127.0.0.1",
+                "listen_port": 1080,
+                "udp": true
+              }
+            ],
+            "outbounds": [
+              {
+                "type": "tuic",
+                "tag": "tuic-out",
+                "server": "$SERVER",
+                "server_port": $PORT,
+                "uuid": "$UUID",
+                "password": "$PASSWORD",
+                "tls": {
+                  "enabled": true,
+                  "server_name": "$SNI",
+                  "alpn": ["$ALPN"],
+                  "insecure": $([ "$INSECURE" = "1" ] && echo true || echo false)
+                },
+                "udp_relay_mode": "native",
+                "congestion_control": "bbr"
+              }
+            ]
           }
           EOF
-          cat /tmp/tuic_client.json
+          cat /tmp/sb_config.json
 
-          echo "[4/4] Starting tuic-client ..."
-          nohup /tmp/tuic -c /tmp/tuic_client.json > /tmp/tuic.log 2>&1 &
+          echo "[4/4] Starting sing-box ..."
+          nohup /tmp/sing-box run -c /tmp/sb_config.json > /tmp/tuic.log 2>&1 &
           TUIC_PID=$!
           echo "TUIC_PID=$TUIC_PID"
           sleep 8
 
-          echo "--- TUIC log ---"
+          echo "--- sing-box log ---"
           cat /tmp/tuic.log || true
-          echo "----------------"
+          echo "--------------------"
 
           echo "Direct IP: $(curl -s --max-time 5 ifconfig.me || echo 'fail')"
           echo "Proxy IP:  $(curl -s --max-time 15 --socks5 127.0.0.1:1080 ifconfig.me || echo 'proxy fail')"
 
           # If proxy works, export env for subsequent step via $GITHUB_ENV
-          if curl -s --max-time 10 --socks5 127.0.0.1:1080 https://www.google.com -o /dev/null; then
+          if curl -s --max-time 10 --socks5-hostname 127.0.0.1:1080 https://www.google.com -o /dev/null; then
             echo "PROXY_OK=1" >> $GITHUB_ENV
             echo "ALL_PROXY=socks5h://127.0.0.1:1080" >> $GITHUB_ENV
             echo "HTTP_PROXY=socks5h://127.0.0.1:1080" >> $GITHUB_ENV
