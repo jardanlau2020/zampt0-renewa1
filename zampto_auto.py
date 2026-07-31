@@ -129,25 +129,81 @@ def main():
 
         # ── 3. Detect login page & handle Logto ─────────────────────────
         if "login" in page.url.lower():
-            log.info("Login page detected")
+            log.info("Login page detected, current URL: %s", page.url)
             screenshot(page, "02_login.png")
 
+            # Step A: Fill email
             if wait_for(page, "input[name='email'], input[type='email'], input[name='username']",
                         15, "email input"):
                 email_input = page.query_selector(
                     "input[name='email'], input[type='email'], input[name='username']")
                 email_input.fill(USERNAME)
+                log.info("Email filled: %s", USERNAME)
                 email_input.press("Enter")
-                time.sleep(1)
+                time.sleep(2)
 
+            # Step B: Fill password
             if wait_for(page, "input[type='password']", 15, "password input"):
                 pwd_input = page.query_selector("input[type='password']")
                 pwd_input.fill(PASSWORD)
-                pwd_input.press("Enter")
-                time.sleep(3)
+                log.info("Password filled")
+                time.sleep(1)
 
+            # Step C: Wait for & solve Cloudflare Turnstile before submitting
+            log.info("Waiting for Cloudflare Turnstile widget...")
+            wait_for(page, "[data-sitekey], .cf-turnstile, [class*='turnstile']",
+                     30, "Cloudflare Turnstile")
+            time.sleep(10)  # Let CloakBrowser auto-solve Turnstile
+            screenshot(page, "03_turnstile_solved.png")
+
+            # Step D: Click Login button explicitly
+            login_selectors = [
+                "button:has-text('Login')",
+                "button:has-text('login')",
+                "input[type='submit']:has-text('Login')",
+                "button[type='submit']",
+                "text=Login",
+                "text=登录",
+            ]
+            login_btn = None
+            for sel in login_selectors:
+                try:
+                    login_btn = page.query_selector(sel)
+                    if login_btn:
+                        log.info("Found Login button with selector: %s", sel)
+                        break
+                except Exception:
+                    continue
+
+            if login_btn:
+                login_btn.click()
+                log.info("Login button clicked")
+            else:
+                log.info("Login button not found, pressing Enter on password field")
+                pwd_input.press("Enter")
+
+            time.sleep(4)
             page.wait_for_load_state("domcontentloaded", timeout=20000)
             screenshot(page, "03_post_login.png")
+
+            # Verify login succeeded
+            post_login_url = page.url
+            post_login_text = page.inner_text("body")[:200]
+            log.info("Post-login URL: %s", post_login_url)
+            log.info("Post-login text: %s", post_login_text)
+
+            if "login" in post_login_url.lower() or "Welcome Back" in post_login_text:
+                log.warning("Login failed — still on login page! Check if Turnstile was solved.")
+                screenshot(page, "03_login_failed.png")
+                # Try one more time: maybe just need to wait longer for Turnstile
+                time.sleep(5)
+                wait_for(page, "[data-sitekey], .cf-turnstile", 15, "Turnstile retry")
+                time.sleep(5)
+                if login_btn:
+                    login_btn.click()
+                    time.sleep(4)
+                    page.wait_for_load_state("domcontentloaded", timeout=20000)
+                    screenshot(page, "03_post_login_retry.png")
 
             server_url = f"{DASHBOARD_URL}/server?id={SERVER_ID}"
             page.goto(server_url, wait_until="domcontentloaded", timeout=90000)
