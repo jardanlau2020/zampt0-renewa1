@@ -120,8 +120,7 @@ jobs:
                 "type": "socks",
                 "tag": "socks-in",
                 "listen": "127.0.0.1",
-                "listen_port": 1080,
-                "udp": true
+                "listen_port": 1080
               }
             ],
             "outbounds": [
@@ -145,6 +144,10 @@ jobs:
           }
           EOF
           cat /tmp/sb_config.json
+
+          # Validate config before running
+          echo "--- Validating config ---"
+          /tmp/sing-box check -c /tmp/sb_config.json || { echo "[ERROR] sing-box config validation failed"; exit 1; }
 
           echo "[4/4] Starting sing-box ..."
           nohup /tmp/sing-box run -c /tmp/sb_config.json > /tmp/tuic.log 2>&1 &
