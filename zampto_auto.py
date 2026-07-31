@@ -123,6 +123,26 @@ def find_csrf_cookie(cookies):
     return None
 
 
+def refresh_csrf_token(api_session, base_url=DASHBOARD_URL):
+    """Fetch a fresh CSRF token by hitting any GET endpoint.
+    The server issues a new zampto_csrf cookie via Set-Cookie on each request.
+    Returns the latest CSRF token from the session cookies."""
+    try:
+        # Hit a lightweight endpoint - the API itself returns Set-Cookie with new CSRF
+        r = api_session.get(f"{base_url}/api/servers", timeout=10)
+        # The Set-Cookie response header auto-updates api_session.cookies
+        # Find the latest csrf cookie value
+        for c in api_session.cookies:
+            if "csrf" in c.name.lower():
+                log.info("Refreshed CSRF token from server (length=%d)", len(c.value))
+                return c.value
+        log.warning("No CSRF cookie in session after refresh")
+        return None
+    except Exception as e:
+        log.warning("CSRF refresh failed: %s", e)
+        return None
+
+
 def get_api_session():
     """Create a requests.Session with all necessary headers for Zampto API.
     Honors ALL_PROXY/HTTPS_PROXY env vars (e.g. socks5h://127.0.0.1:1080)"""
@@ -377,8 +397,27 @@ def phase_api_renewal(use_cookies=None):
         started = False
         if not is_running:
             log.info("Server is stopped, attempting to start...")
-            # Try both common path patterns
-            for start_path in [f"{used_path}/start", f"/api/server/{SERVER_ID}/start"]:
+            # Refresh CSRF token immediately before POST - Laravel-style panels
+            # issue a new CSRF cookie on every request and require matching header
+            fresh_csrf = refresh_csrf_token(api_session)
+            if fresh_csrf:
+                api_session.headers.update({
+                    "X-CSRF-Token": fresh_csrf,
+                    "X-XSRF-Token": fresh_csrf,
+                    "X-Csrf-Token": fresh_csrf,
+                })
+                log.info("Using fresh CSRF token for POST (length=%d)", len(fresh_csrf))
+
+            # The server has 'panel_id' field which suggests Pterodactyl-style API
+            # Try /api/servers/{id}/start first since we got list from /api/servers
+            start_paths = [
+                f"/api/servers/{SERVER_ID}/start",
+                f"/api/servers/start",
+                f"/api/server/{SERVER_ID}/start",
+                f"/api/server/{SERVER_ID}/power",
+                f"/api/servers/{SERVER_ID}/power",
+            ]
+            for start_path in start_paths:
                 start_url = f"{DASHBOARD_URL}{start_path}"
                 log.info("  Trying start endpoint: %s", start_path)
                 resp = api_session.post(start_url, timeout=15)
@@ -391,27 +430,70 @@ def phase_api_renewal(use_cookies=None):
                     break
                 else:
                     log.warning("  Start failed at %s: %d %s", start_path, resp.status_code, resp.text[:200])
+                    # If CSRF error, refresh and retry this path
+                    if "CSRF" in resp.text or "csrf" in resp.text.lower():
+                        log.info("  CSRF error detected, refreshing token...")
+                        fresh_csrf = refresh_csrf_token(api_session)
+                        if fresh_csrf:
+                            api_session.headers.update({
+                                "X-CSRF-Token": fresh_csrf,
+                                "X-XSRF-Token": fresh_csrf,
+                                "X-Csrf-Token": fresh_csrf,
+                            })
             if not started:
                 report["error"] = "Start failed on all probed endpoints"
 
         # Check expiry and renew
         if report["action"] in ("started", "skipped"):
-            expiry_val = state_info.get("expiry") if isinstance(state_info, dict) else None
+            expiry_val = state_info.get("expiry") or state_info.get("renewal") if isinstance(state_info, dict) else None
             if expiry_val:
                 report["expiry"] = str(expiry_val)
-                # Parse hours from expiry string (basic parsing)
-                m = re.search(r'(\d+)\s*(?:day|d|天)', expiry_val, re.IGNORECASE)
-                h = re.search(r'(\d+)\s*(?:hour|h|小时)', expiry_val, re.IGNORECASE)
-                days = int(m.group(1)) if m else 0
-                hours = int(h.group(1)) if h else 0
-                total_h = days * 24 + hours
-                log.info("Expiry: %s = %d days %d h = %d h total", expiry_val, days, hours, total_h)
+                # Parse hours - support ISO datetime or "X days Y hours" string
+                total_h = None
+                # Try ISO datetime (e.g. "2026-07-30T12:28:33.000Z")
+                iso_match = re.match(r'(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})', str(expiry_val))
+                if iso_match:
+                    try:
+                        from datetime import datetime as dt_cls
+                        expiry_dt = dt_cls.fromisoformat(iso_match.group(1).replace("Z", "+00:00"))
+                        now_dt = datetime.now(timezone.utc)
+                        if expiry_dt.tzinfo is None:
+                            expiry_dt = expiry_dt.replace(tzinfo=timezone.utc)
+                        delta = expiry_dt - now_dt
+                        total_h = max(0, int(delta.total_seconds() // 3600))
+                        log.info("Expiry (ISO): %s => %d hours remaining (now=%s)", expiry_val, total_h, now_dt.isoformat())
+                    except Exception as e:
+                        log.warning("Failed to parse ISO datetime %s: %s", expiry_val, e)
+                        total_h = 0  # Treat as expired -> renew
+
+                # Fallback to string parsing (e.g. "3 days 5 hours")
+                if total_h is None:
+                    m = re.search(r'(\d+)\s*(?:day|d|天)', str(expiry_val), re.IGNORECASE)
+                    h = re.search(r'(\d+)\s*(?:hour|h|小时)', str(expiry_val), re.IGNORECASE)
+                    days = int(m.group(1)) if m else 0
+                    hours = int(h.group(1)) if h else 0
+                    total_h = days * 24 + hours
+                    log.info("Expiry (string): %s = %d days %d h = %d h total", expiry_val, days, hours, total_h)
 
                 should_renew = FORCE_RENEW or total_h < 48
                 if should_renew:
                     log.info("Renewing server (%d h left, threshold: 48h)", total_h)
+                    # Refresh CSRF before renew POST
+                    fresh_csrf = refresh_csrf_token(api_session)
+                    if fresh_csrf:
+                        api_session.headers.update({
+                            "X-CSRF-Token": fresh_csrf,
+                            "X-XSRF-Token": fresh_csrf,
+                            "X-Csrf-Token": fresh_csrf,
+                        })
                     renewed = False
-                    for renew_path in [f"{used_path}/renew", f"/api/server/{SERVER_ID}/renew"]:
+                    renew_paths = [
+                        f"/api/servers/{SERVER_ID}/renew",
+                        f"/api/server/{SERVER_ID}/renew",
+                        f"{used_path}/renew",
+                        f"/api/servers/renew",
+                    ]
+                    for renew_path in renew_paths:
                         renew_url = f"{DASHBOARD_URL}{renew_path}"
                         log.info("  Trying renew endpoint: %s", renew_path)
                         resp = api_session.post(renew_url, timeout=15)
@@ -422,9 +504,17 @@ def phase_api_renewal(use_cookies=None):
                             break
                         else:
                             log.warning("  Renew failed at %s: %d %s", renew_path, resp.status_code, resp.text[:200])
+                            # Refresh CSRF if needed
+                            if "CSRF" in resp.text or "csrf" in resp.text.lower():
+                                fresh_csrf = refresh_csrf_token(api_session)
+                                if fresh_csrf:
+                                    api_session.headers.update({
+                                        "X-CSRF-Token": fresh_csrf,
+                                        "X-XSRF-Token": fresh_csrf,
+                                        "X-Csrf-Token": fresh_csrf,
+                                    })
                     if not renewed:
                         report["error"] = "Renewal failed on all probed endpoints"
-                        report["error"] = f"Renewal failed: {resp.status_code}"
                 else:
                     report["action"] = "skipped"
                     log.info("Not renewing - %d hours remaining (threshold: 48)", total_h)
