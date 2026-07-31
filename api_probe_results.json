@@ -1,0 +1,114 @@
+[
+  {
+    "path": "/api/server",
+    "status": 403,
+    "content_type": "application/json;charset=utf-8",
+    "is_json": true,
+    "body_preview": "{\"error\":\"Access blocked\",\"reason\":\"VPN or proxy detected\"}"
+  },
+  {
+    "path": "/api/servers",
+    "status": 403,
+    "content_type": "application/json;charset=utf-8",
+    "is_json": true,
+    "body_preview": "{\"error\":\"Access blocked\",\"reason\":\"VPN or proxy detected\"}"
+  },
+  {
+    "path": "/api/server/list",
+    "status": 403,
+    "content_type": "application/json;charset=utf-8",
+    "is_json": true,
+    "body_preview": "{\"error\":\"Access blocked\",\"reason\":\"VPN or proxy detected\"}"
+  },
+  {
+    "path": "/api/servers/list",
+    "status": 403,
+    "content_type": "application/json;charset=utf-8",
+    "is_json": true,
+    "body_preview": "{\"error\":\"Access blocked\",\"reason\":\"VPN or proxy detected\"}"
+  },
+  {
+    "path": "/api/me",
+    "status": 403,
+    "content_type": "application/json;charset=utf-8",
+    "is_json": true,
+    "body_preview": "{\"error\":\"Access blocked\",\"reason\":\"VPN or proxy detected\"}"
+  },
+  {
+    "path": "/api/user",
+    "status": 403,
+    "content_type": "application/json;charset=utf-8",
+    "is_json": true,
+    "body_preview": "{\"error\":\"Access blocked\",\"reason\":\"VPN or proxy detected\"}"
+  },
+  {
+    "path": "/api/user/servers",
+    "status": 403,
+    "content_type": "application/json;charset=utf-8",
+    "is_json": true,
+    "body_preview": "{\"error\":\"Access blocked\",\"reason\":\"VPN or proxy detected\"}"
+  },
+  {
+    "path": "/api/users/me",
+    "status": 403,
+    "content_type": "application/json;charset=utf-8",
+    "is_json": true,
+    "body_preview": "{\"error\":\"Access blocked\",\"reason\":\"VPN or proxy detected\"}"
+  },
+  {
+    "path": "/api/account",
+    "status": 403,
+    "content_type": "application/json;charset=utf-8",
+    "is_json": true,
+    "body_preview": "{\"error\":\"Access blocked\",\"reason\":\"VPN or proxy detected\"}"
+  },
+  {
+    "path": "/api/account/servers",
+    "status": 403,
+    "content_type": "application/json;charset=utf-8",
+    "is_json": true,
+    "body_preview": "{\"error\":\"Access blocked\",\"reason\":\"VPN or proxy detected\"}"
+  },
+  {
+    "path": "/api/dashboard",
+    "status": 403,
+    "content_type": "application/json;charset=utf-8",
+    "is_json": true,
+    "body_preview": "{\"error\":\"Access blocked\",\"reason\":\"VPN or proxy detected\"}"
+  },
+  {
+    "path": "/api/dashboard/servers",
+    "status": 403,
+    "content_type": "application/json;charset=utf-8",
+    "is_json": true,
+    "body_preview": "{\"error\":\"Access blocked\",\"reason\":\"VPN or proxy detected\"}"
+  },
+  {
+    "path": "/api/v1/server",
+    "status": 403,
+    "content_type": "application/json;charset=utf-8",
+    "is_json": true,
+    "body_preview": "{\"error\":\"Access blocked\",\"reason\":\"VPN or proxy detected\"}"
+  },
+  {
+    "path": "/api/v1/servers",
+    "status": 403,
+    "content_type": "application/json;charset=utf-8",
+    "is_json": true,
+    "body_preview": "{\"error\":\"Access blocked\",\"reason\":\"VPN or proxy detected\"}"
+  },
+  {
+    "path": "/api/v2/server",
+    "status": 403,
+    "content_type": "application/json;charset=utf-8",
+    "is_json": true,
+    "body_preview": "{\"error\":\"Access blocked\",\"reason\":\"VPN or proxy detected\"}"
+  },
+  {
+    "path": "/api/v2/servers",
+    "status": 403,
+    "content_type": "application/json;charset=utf-8",
+    "is_json": true,
+    "body_preview": "{\"error\":\"Access blocked\",\"reason\":\"VPN or proxy detected\"}"
+  }
+]

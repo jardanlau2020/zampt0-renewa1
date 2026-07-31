@@ -280,20 +280,88 @@ def phase_api_renewal(use_cookies=None):
     except Exception as e:
         log.error("Session verification failed: %s", e)
 
-    # Fetch server info
+    # Fetch server info - probe multiple candidate paths if first one fails
     try:
-        server_url = f"{DASHBOARD_URL}/api/server/{SERVER_ID}"
-        log.info("Fetching server info from: %s", server_url)
-        resp = api_session.get(server_url, timeout=15)
-        if resp.status_code != 200:
-            log.error("API returned %d, body[:500]=%s", resp.status_code, resp.text[:500])
-        resp.raise_for_status()
-        server_data = resp.json()
-        log.info("Server data received (truncated): %s", json.dumps(server_data, indent=2, ensure_ascii=False)[:600])
+        # Candidate API paths in order of likelihood
+        candidate_paths = [
+            f"/api/server/{SERVER_ID}",
+            f"/api/servers/{SERVER_ID}",
+            f"/api/server?server_id={SERVER_ID}",
+            f"/api/server?id={SERVER_ID}",
+            f"/api/v1/server/{SERVER_ID}",
+            f"/api/v1/servers/{SERVER_ID}",
+            f"/api/v2/server/{SERVER_ID}",
+            f"/api/dashboard/server/{SERVER_ID}",
+            f"/api/dashboard/servers/{SERVER_ID}",
+            f"/api/user/servers/{SERVER_ID}",
+            f"/api/account/servers/{SERVER_ID}",
+            # List endpoints (will need to find server in list)
+            "/api/servers",
+            "/api/server",
+            "/api/dashboard/servers",
+            "/api/user/servers",
+            "/api/account/servers",
+        ]
 
-        # Parse status
+        server_url = None
+        server_data = None
+        used_path = None
+
+        for path in candidate_paths:
+            url = f"{DASHBOARD_URL}{path}"
+            log.info("Probing: %s", path)
+            try:
+                resp = api_session.get(url, timeout=15)
+                ct = resp.headers.get("content-type", "")
+                is_json = "json" in ct.lower()
+                log.info("  -> %d %s (len=%d)", resp.status_code, "JSON" if is_json else "HTML", len(resp.text))
+
+                # 200 + JSON = success
+                if resp.status_code == 200 and is_json:
+                    server_url = url
+                    used_path = path
+                    server_data = resp.json()
+                    log.info("  ✓ Found valid API endpoint!")
+                    break
+
+                # 404 + HTML = path doesn't exist, try next
+                if resp.status_code == 404 and not is_json:
+                    continue
+
+                # 403 + JSON = path exists but VPN/IP blocked
+                if resp.status_code == 403 and is_json:
+                    log.warning("  Path exists but blocked: %s", resp.text[:200])
+                    # The path is correct but we can't access via current IP
+                    # If proxy is configured, this shouldn't happen
+                    continue
+
+                # Other errors - log and continue
+                log.warning("  Unexpected: %d body[:200]=%s", resp.status_code, resp.text[:200])
+            except requests.exceptions.RequestException as e:
+                log.warning("  Request failed: %s", e)
+                continue
+
+        if not server_data:
+            log.error("Could not find a working API endpoint for server info")
+            log.error("Probed %d paths, none returned 200+JSON", len(candidate_paths))
+            report["error"] = "No working API endpoint found. Probed paths: " + ", ".join(candidate_paths[:5]) + "..."
+            _report(report)
+            return False
+
+        log.info("Using endpoint: %s", used_path)
+        log.info("Server data received (truncated): %s", json.dumps(server_data, indent=2, ensure_ascii=False)[:800])
+
+        # Parse status - data may be a list (from list endpoint) or single object
         state_info = server_data.get("data", {}) if isinstance(server_data, dict) else {}
+        if isinstance(state_info, list):
+            # List endpoint - find our server
+            log.info("Got list of %d servers, looking for ID=%s", len(state_info), SERVER_ID)
+            state_info = next((s for s in state_info if str(s.get("id")) == str(SERVER_ID)), state_info[0] if state_info else {})
+
         status_state = state_info.get("status", {}).get("state", "").lower() if isinstance(state_info, dict) else ""
+        if not status_state and isinstance(state_info, dict):
+            # Try alternative status field formats
+            status_state = str(state_info.get("state", state_info.get("status", ""))).lower()
         is_running = status_state in ["running", "started", "active", "online"]
 
         report.update({
@@ -309,17 +377,22 @@ def phase_api_renewal(use_cookies=None):
         started = False
         if not is_running:
             log.info("Server is stopped, attempting to start...")
-            start_url = f"{DASHBOARD_URL}/api/server/{SERVER_ID}/start"
-            resp = api_session.post(start_url, timeout=15)
-            if resp.status_code in [200, 201, 204, 202]:
-                report["action"] = "started"
-                log.info("Server start initiated successfully (status %d)", resp.status_code)
-                is_running = True
-                report["status"] = "running"
-                started = True
-            else:
-                log.error("Start attempt failed: %d %s", resp.status_code, resp.text[:200])
-                report["error"] = f"Start failed: {resp.status_code}"
+            # Try both common path patterns
+            for start_path in [f"{used_path}/start", f"/api/server/{SERVER_ID}/start"]:
+                start_url = f"{DASHBOARD_URL}{start_path}"
+                log.info("  Trying start endpoint: %s", start_path)
+                resp = api_session.post(start_url, timeout=15)
+                if resp.status_code in [200, 201, 204, 202]:
+                    report["action"] = "started"
+                    log.info("  ✓ Server start initiated (status %d)", resp.status_code)
+                    is_running = True
+                    report["status"] = "running"
+                    started = True
+                    break
+                else:
+                    log.warning("  Start failed at %s: %d %s", start_path, resp.status_code, resp.text[:200])
+            if not started:
+                report["error"] = "Start failed on all probed endpoints"
 
         # Check expiry and renew
         if report["action"] in ("started", "skipped"):
@@ -337,13 +410,20 @@ def phase_api_renewal(use_cookies=None):
                 should_renew = FORCE_RENEW or total_h < 48
                 if should_renew:
                     log.info("Renewing server (%d h left, threshold: 48h)", total_h)
-                    renew_url = f"{DASHBOARD_URL}/api/server/{SERVER_ID}/renew"
-                    resp = api_session.post(renew_url, timeout=15)
-                    if resp.status_code in [200, 201, 204, 202]:
-                        report["action"] = "renewed"
-                        log.info("Renewal successful (status %d)", resp.status_code)
-                    else:
-                        log.error("Renewal failed: %d %s", resp.status_code, resp.text[:200])
+                    renewed = False
+                    for renew_path in [f"{used_path}/renew", f"/api/server/{SERVER_ID}/renew"]:
+                        renew_url = f"{DASHBOARD_URL}{renew_path}"
+                        log.info("  Trying renew endpoint: %s", renew_path)
+                        resp = api_session.post(renew_url, timeout=15)
+                        if resp.status_code in [200, 201, 204, 202]:
+                            report["action"] = "renewed"
+                            log.info("  ✓ Renewal successful (status %d)", resp.status_code)
+                            renewed = True
+                            break
+                        else:
+                            log.warning("  Renew failed at %s: %d %s", renew_path, resp.status_code, resp.text[:200])
+                    if not renewed:
+                        report["error"] = "Renewal failed on all probed endpoints"
                         report["error"] = f"Renewal failed: {resp.status_code}"
                 else:
                     report["action"] = "skipped"

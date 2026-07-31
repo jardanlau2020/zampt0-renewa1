@@ -200,11 +200,20 @@ jobs:
           fi
 
           python zampto_auto.py
+          PYTHON_EXIT=$?
 
           sleep 2
           [ -n "$RECORD_PID" ] && kill $RECORD_PID 2>/dev/null
           [ -n "$RECORD_PID" ] && wait $RECORD_PID 2>/dev/null
           kill $XVFB_PID 2>/dev/null
+
+          # CRITICAL: Clear proxy env vars so subsequent Node.js steps (upload-artifact,
+          # checkout cleanup) don't try to use SOCKS5 which they don't support
+          echo "ALL_PROXY=" >> $GITHUB_ENV
+          echo "HTTP_PROXY=" >> $GITHUB_ENV
+          echo "HTTPS_PROXY=" >> $GITHUB_ENV
+
+          exit $PYTHON_EXIT
 
       - name: 📸 上传截图
         if: always()
