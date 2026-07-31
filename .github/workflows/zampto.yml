@@ -1,4 +1,4 @@
-name: Zampto Auto Renewal
+name: Zampto 自动续期
 
 on:
   schedule:
@@ -20,7 +20,7 @@ on:
 
 jobs:
   zampto-auto:
-    name: Check & Auto-Renew
+    name: 检查并自动续期
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
@@ -31,12 +31,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Python 3.12
+      - name: 🐍 配置 Python 3.12
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
-      - name: Install system deps
+      - name: 📦 安装系统依赖
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq \
@@ -46,12 +46,12 @@ jobs:
             libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 \
             libxfixes3 libxrandr2 libgbm1 libasound2t64
 
-      - name: Install Python deps
+      - name: 📦 安装 Python 依赖
         run: |
           pip install -r requirements.txt
           python -c "from cloakbrowser import ensure_binary; ensure_binary()"
 
-      - name: Start Hysteria2 proxy (optional)
+      - name: 🌐 启动 Hysteria2 代理（可选）
         env:
           HY2_CONFIG: ${{ secrets.HY2_CONFIG }}
         run: |
@@ -68,7 +68,7 @@ jobs:
             echo "Proxy IP: $(curl -s --max-time 10 --socks5 127.0.0.1:1080 ifconfig.me || echo 'proxy fail')"
           fi
 
-      - name: Run renewal
+      - name: 🔄 运行续期脚本
         env:
           ZAMPTO_USERNAME: ${{ secrets.ZAMPTO_USERNAME }}
           ZAMPTO_PASSWORD: ${{ secrets.ZAMPTO_PASSWORD }}
@@ -100,7 +100,7 @@ jobs:
           [ -n "$RECORD_PID" ] && wait $RECORD_PID 2>/dev/null
           kill $XVFB_PID 2>/dev/null
 
-      - name: Upload artifacts
+      - name: 📸 上传截图
         if: always()
         uses: actions/upload-artifact@v4
         with:
