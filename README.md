@@ -1,106 +1,106 @@
-# Zampto Auto Renewal ⚡
+# Zampto 自动续期 ⚡
 
-Automatically check and renew your Zampto Minecraft server daily via GitHub Actions.
+通过 GitHub Actions 每日自动检查并续期你的 Zampto Minecraft 服务器。
 
-**Features:**
-- Daily auto-check at UTC 00:00 (Beijing 08:00)
-- Auto-start if stopped
-- Auto-renew when expiry < 48 hours (configurable)
-- Telegram Bot notifications on completion or failure
-- Two-phase auth to bypass Cloudflare Turnstile
+**功能特性：**
+- 每日 UTC 00:00（北京时间 08:00）自动检查
+- 服务器停止时自动启动
+- 到期时间不足 48 小时自动续期（可配置）
+- 完成或失败时通过 Telegram Bot 推送通知
+- 两阶段认证机制，绕过 Cloudflare Turnstile 验证
 
 ---
 
-## 🚀 Setup Guide
+## 🚀 配置指南
 
-### Phase 1: Initial Login (Local, One-Time)
+### 阶段一：首次登录（本地，一次性操作）
 
-Run this **once on your local machine** to authenticate with Zampto:
+在你的**本地机器**上运行一次，完成 Zampto 身份验证：
 
 ```bash
 python zampto_auto.py
 ```
 
-A browser window will open. Complete the login normally (including any Turnstile CAPTCHA). After successful login, the script saves `./screenshots/session.json`.
+会自动打开一个浏览器窗口，请按正常流程完成登录（包括可能出现的 Turnstile 验证码）。登录成功后，脚本会将认证信息保存到 `./screenshots/session.json`。
 
-> 💡 The session file contains your authenticated cookies. Do NOT share it publicly.
+> 💡 该 session 文件包含你的登录 Cookie，切勿公开分享。
 
 ---
 
-### Phase 2: Configure GitHub Secrets
+### 阶段二：配置 GitHub Secrets
 
-On your GitHub repository (**weikkadd/zampto**):
+在你的 GitHub 仓库（**weikkadd/zampto**）中：
 
-1. Go to **Settings → Secrets and variables → Actions**
-2. Click **New secret** for each of the following:
+1. 进入 **Settings → Secrets and variables → Actions**
+2. 点击 **New secret**，依次添加以下变量：
 
-| Secret Name | Description | Example Value |
-|-------------|-------------|---------------|
-| `ZAMPTO_USERNAME` | Your Zampto account email | `user@example.com` |
-| `ZAMPTO_PASSWORD` | Your Zampto password | `********` |
-| `ZAMPTO_SERVER_ID` | Server ID (e.g., 6578) | `6578` |
-| `TG_BOT_TOKEN` | Bot token from @BotFather | `123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11` |
-| `TG_CHAT_ID` | Your chat ID from @userbotbot | `123456789` |
-| `ZAMPTO_SESSION_SECRET` (NEW) | Session JSON encoded as base64 | `{base64-encoded session.json content}` |
-| `HY2_CONFIG` (Optional) | Hysteria2 config YAML | *(optional)* |
+| Secret 名称 | 说明 | 示例值 |
+|-------------|------|--------|
+| `ZAMPTO_USERNAME` | Zampto 账户邮箱 | `user@example.com` |
+| `ZAMPTO_PASSWORD` | Zampto 账户密码 | `********` |
+| `ZAMPTO_SERVER_ID` | 服务器 ID（例如 6578） | `6578` |
+| `TG_BOT_TOKEN` | 来自 @BotFather 的 Bot Token | `123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11` |
+| `TG_CHAT_ID` | 来自 @userbotbot 的 Chat ID | `123456789` |
+| `ZAMPTO_SESSION_SECRET`（新增） | session.json 的 base64 编码字符串 | `{base64 编码后的 session.json 内容}` |
+| `HY2_CONFIG`（可选） | Hysteria2 配置 YAML | *（可选）* |
 
-To generate `ZAMPTO_SESSION_SECRET`:
+生成 `ZAMPTO_SESSION_SECRET` 的方法：
 ```python
 import json, base64
 with open("./screenshots/session.json") as f:
     session = json.load(f)
 encoded = base64.b64encode(json.dumps(session).encode()).decode()
-print(encoded)  # Copy this into the secret
+print(encoded)  # 复制这段内容到 Secret 中
 ```
 
 ---
 
-### Phase 3: Verify Workflow
+### 阶段三：验证工作流
 
-The workflow is triggered automatically every day at UTC 00:00. You can also manually trigger it via **Actions → Run workflow**.
-
----
-
-## 🔒 Security Note
-
-- Never commit `session.json` to Git (it's already in `.gitignore`)
-- Use a dedicated GitHub Personal Access Token (classic, repo scope) for git push operations
-- Keep `ZAMPTO_SESSION_SECRET` confidential — it provides authenticated access to your server
+工作流会在每天 UTC 00:00 自动触发。你也可以通过 **Actions → Run workflow** 手动触发一次进行验证。
 
 ---
 
-## 🐍 Requirements
+## 🔒 安全提示
+
+- 切勿将 `session.json` 提交到 Git 仓库（已在 `.gitignore` 中排除）
+- 推送代码时建议使用专门的 GitHub Personal Access Token（Classic 类型，仅需 repo 权限）
+- 妥善保管 `ZAMPTO_SESSION_SECRET`——它等同于你服务器的登录凭证
+
+---
+
+## 🐍 依赖说明
 
 ```
-cloakbrowser[geoip]   # Only needed for Phase 1 (browser login)
-requests               # For pure API renewal
+cloakbrowser[geoip]   # 仅阶段一（本地浏览器登录）需要
+requests               # 用于纯 API 续期
 ```
 
-GitHub Actions installs both automatically via `requirements.txt`.
+GitHub Actions 会通过 `requirements.txt` 自动安装以上依赖。
 
 ---
 
-## 🛠 Troubleshooting
+## 🛠 常见问题排查
 
-- **Login still fails after manual phase?** Clear the old session file and re-run Phase 1.
-- **API returns 403/401?** Your session may have expired. Re-run Phase 1 to get a new one and update the `ZAMPTO_SESSION_SECRET`.
-- **"Server not found" error?** Verify `ZAMPTO_SERVER_ID` is correct.
+- **完成阶段一后仍然登录失败？** 删除旧的 session 文件，重新执行阶段一。
+- **API 返回 403 / 401？** Session 可能已过期，重新执行阶段一获取新的 session，并更新 `ZAMPTO_SESSION_SECRET`。
+- **出现 "Server not found" 错误？** 请检查 `ZAMPTO_SERVER_ID` 是否正确。
 
 ---
 
-## 📖 Architecture Overview
+## 📖 架构说明
 
 ```
-Phase 1 (local, once):
-  Browser → Login page → Solve Turnstile manually → Save session.json
+阶段一（本地，一次性）：
+  浏览器 → 登录页面 → 手动通过 Turnstile → 保存 session.json
 
-Phase 2 (GitHub Actions, daily):
-  ZAMPTO_SESSION_SECRET (base64) → Decode → requests.Session → Direct API calls
+阶段二（GitHub Actions，每日执行）：
+  ZAMPTO_SESSION_SECRET (base64) → 解码 → requests.Session → 直接调用 API
   ↓
-  /api/server/{id} → Check status
-  POST /api/server/{id}/start   → If stopped
-  POST /api/server/{id}/renew   → If expiry < 48h
-  Telegram Bot → Send report
+  /api/server/{id}      → 检查服务器状态
+  POST /api/server/{id}/start   → 若服务器已停止
+  POST /api/server/{id}/renew   → 若到期时间 < 48 小时
+  Telegram Bot → 推送执行报告
 ```
 
-By bypassing the login page entirely in Phase 2, we avoid the Cloudflare Turnstile problem completely.
+阶段二完全跳过登录页面，直接复用 Cookie 调用 API，从而彻底规避 Cloudflare Turnstile 问题。
