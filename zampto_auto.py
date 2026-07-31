@@ -1,20 +1,16 @@
 #!/usr/bin/env python3
-"""Zampto Auto Renewal - requests-based login with CSRF + fake Turnstile.
+"""Zampto Auto Renewal - CloakBrowser-based login with Turnstile handling.
 
-Discovered API endpoints from previous runs:
-- POST /api/login → 403 "Invalid CSRF token" (but endpoint EXISTS)
-- POST /api/auth/login → 400 "Security verification failed"
-- POST /auth/login → 200 (just re-renders login page)
-
-Strategy:
-1. Use CloakBrowser to load login page and get initial cookies + CSRF token
-2. Use requests.Session (sharing cookies from browser) to POST /api/login
-   with form-encoded data including csrf_token + fake cf-turnstile-response
-3. If that fails, POST /api/auth/login with Turnstile token
-4. If both fail, fall back to browser form click
+JS source analysis revealed:
+- Login endpoint: POST /api/auth/login with JSON body {email, password, turnstile_token}
+- Header: x-device-id (UUID from localStorage)
+- Turnstile sitekey: 0x4AAAAAAD5hn7QjjDUPXOcK
+- Form submit handler calls fetch('/api/auth/login', ...) with turnstile token
+- If n.requires_2fa -> redirect to /auth/login/2fa
+- Success -> push to '/' and refresh
 """
 
-import os, re, sys, json, time, logging
+import os, re, sys, json, time, logging, uuid
 from datetime import datetime, timezone
 import requests
 from cloakbrowser import launch
@@ -26,6 +22,7 @@ TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "")
 TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
 FORCE_RENEW = os.getenv("FORCE_RENEW", "false").lower() == "true"
 DASHBOARD_URL = "https://dash.zampto.net"
+TURNSTILE_SITEKEY = "0x4AAAAAAD5hn7QjjDUPXOcK"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s")
 log = logging.getLogger("zampto")
@@ -55,199 +52,8 @@ def snap(page, name, path="./screenshots"):
     return fp
 
 
-def extract_csrf_from_html(html):
-    """Extract CSRF token from page HTML."""
-    for pat in [
-        r'name=["\']_csrf["\']\s*value=["\']([^"\']+)',
-        r'name=["\']csrf_token["\']\s*value=["\']([^"\']+)',
-        r'"csrfToken"\s*:\s*"([^"]+)"',
-        r'csrfToken["\']\s*:\s*["\']([^"\']+)',
-    ]:
-        m = re.search(pat, html, re.DOTALL)
-        if m:
-            return m.group(1)
-    return ""
-
-
-def extract_csrf_from_cookies(cookies):
-    """Extract CSRF token from cookie list."""
-    for c in cookies:
-        if "csrf" in c.get("name", "").lower():
-            return c["value"]
-    return ""
-
-
-def make_turnstile_token():
-    """Generate a plausible-looking Cloudflare Turnstile response token."""
-    import base64
-    random_data = os.urandom(48).hex()
-    token_body = base64.urlsafe_b64encode(
-        f"fake::{random_data}::{time.time()}".encode()
-    ).decode().rstrip("=")
-    return f"0.{token_body}"
-
-
-def sync_browser_cookies_to_session(page, session):
-    """Copy cookies from Playwright browser context to requests.Session."""
-    try:
-        pw_cookies = page.context.cookies()
-        session.cookies.clear()
-        for c in pw_cookies:
-            session.cookies.set(
-                c["name"],
-                c["value"],
-                domain=c.get("domain", ""),
-                path=c.get("path", "/"),
-                secure=c.get("secure", False),
-                expires=c.get("expires"),
-            )
-        log.info("Synced %d cookies from browser to requests.Session", len(pw_cookies))
-    except Exception as e:
-        log.warning("Failed to sync cookies: %s", e)
-
-
-def try_api_login(session, csrf_token):
-    """Try POST to /api/login with CSRF + fake Turnstile token."""
-    turnstile = make_turnstile_token()
-
-    # Try form-encoded (matching what the browser form sends)
-    form_data = {
-        "email": USERNAME,
-        "password": PASSWORD,
-        "csrf_token": csrf_token,
-        "cf-turnstile-response": turnstile,
-    }
-
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                       "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-        "Accept": "application/json, text/plain, */*",
-        "Referer": f"{DASHBOARD_URL}/auth/login",
-        "Origin": DASHBOARD_URL,
-    }
-
-    log.info("Trying POST %s/api/login (form-encoded)", DASHBOARD_URL)
-    try:
-        r = session.post(f"{DASHBOARD_URL}/api/login", data=form_data, headers=headers, timeout=15)
-        log.info("Status: %d | Body: %s", r.status_code, r.text[:300])
-        # Sync cookies back
-        for c in r.cookies:
-            session.cookies.set(c.name, c.value, domain=c.domain, path=c.path)
-
-        if r.status_code == 200:
-            body = r.text.lower()
-            if "success" in body or "welcome" in body or "dashboard" in body:
-                return True, "api/login 200"
-            # Check if it's JSON with error
-            try:
-                data = r.json()
-                if "error" in data:
-                    log.warning("/api/login error: %s", data["error"])
-                else:
-                    return True, "api/login 200 (no error)"
-            except Exception:
-                return True, "api/login 200 (HTML)"
-        elif r.status_code == 403:
-            log.warning("/api/login 403 - CSRF/turnstile rejected")
-        elif r.status_code == 400:
-            log.warning("/api/login 400 - bad request")
-    except Exception as e:
-        log.warning("/api/login failed: %s", e)
-
-    # Try JSON variant
-    headers_json = {
-        "User-Agent": headers["User-Agent"],
-        "Content-Type": "application/json",
-        "Accept": "application/json, text/plain, */*",
-        "Referer": f"{DASHBOARD_URL}/auth/login",
-        "Origin": DASHBOARD_URL,
-    }
-    headers_json["Content-Type"] = "application/json"
-    log.info("Trying POST %s/api/login (JSON)", DASHBOARD_URL)
-    try:
-        r = session.post(f"{DASHBOARD_URL}/api/login", json=form_data, headers=headers_json, timeout=15)
-        log.info("Status: %d | Body: %s", r.status_code, r.text[:300])
-        for c in r.cookies:
-            session.cookies.set(c.name, c.value, domain=c.domain, path=c.path)
-
-        if r.status_code == 200:
-            return True, "api/login JSON 200"
-        elif r.status_code == 403:
-            log.warning("/api/login JSON 403")
-        else:
-            log.warning("/api/login JSON %d", r.status_code)
-    except Exception as e:
-        log.warning("/api/login JSON failed: %s", e)
-
-    # Try /api/auth/login
-    log.info("Trying POST %s/api/auth/login", DASHBOARD_URL)
-    try:
-        r = session.post(f"{DASHBOARD_URL}/api/auth/login", data=form_data, headers=headers, timeout=15)
-        log.info("Status: %d | Body: %s", r.status_code, r.text[:300])
-        for c in r.cookies:
-            session.cookies.set(c.name, c.value, domain=c.domain, path=c.path)
-
-        if r.status_code == 200:
-            return True, "api/auth/login 200"
-        elif r.status_code == 400:
-            log.warning("/api/auth/login 400: %s", r.text[:200])
-    except Exception as e:
-        log.warning("/api/auth/login failed: %s", e)
-
-    return False, "all API endpoints failed"
-
-
-def try_fetch_login(page):
-    """Use browser's own fetch API to submit login with fake Turnstile token."""
-    turnstile = make_turnstile_token()
-
-    js = f"""
-    (function() {{
-      return new Promise((resolve) => {{
-        var token = '{turnstile}';
-        var formData = new FormData();
-        formData.append('email', '{USERNAME}');
-        formData.append('password', '{PASSWORD}');
-
-        // Find CSRF token from hidden input or cookie
-        var csrf = '';
-        var hiddenInputs = document.querySelectorAll('input[type="hidden"]');
-        hiddenInputs.forEach(function(inp) {{
-          if (inp.name && inp.name.toLowerCase().includes('csrf')) {{
-            csrf = inp.value;
-          }}
-        }});
-
-        if (csrf) formData.append('csrf_token', csrf);
-        formData.append('cf-turnstile-response', token);
-
-        // Try API endpoint
-        fetch('{DASHBOARD_URL}/api/login', {{
-          method: 'POST',
-          body: formData,
-          credentials: 'include',
-        }}).then(function(r) {{
-          return r.text().then(function(t) {{
-            console.log('API/login status:', r.status);
-            console.log('API/login body:', t.substring(0, 500));
-            resolve(JSON.stringify({{status: r.status, body: t.substring(0, 500),
-              location: r.headers.get('location') || ''}}));
-          }});
-        }}).catch(function(e) {{
-          console.log('API/login error:', e.message);
-          resolve(JSON.stringify({{status: -1, error: e.message}}));
-        }});
-      }});
-    }})();
-    """
-    try:
-        result = page.evaluate(js)
-        log.info("Fetch login result: %s", result)
-        return result
-    except Exception as e:
-        log.warning("Fetch login failed: %s", e)
-        return ""
+def generate_device_id():
+    return uuid.uuid4().hex
 
 
 def main():
@@ -257,6 +63,8 @@ def main():
 
     log.info("=== Zampto Auto Renewal ===")
     log.info("Server ID: %s | Force: %s", SERVER_ID, FORCE_RENEW)
+    device_id = generate_device_id()
+    log.info("Device ID: %s", device_id)
 
     report = {
         "server_id": SERVER_ID, "status": "unknown", "action": "none",
@@ -267,146 +75,226 @@ def main():
     page = None
 
     try:
-        # ── 1. Launch CloakBrowser ──
         log.info("Launching CloakBrowser (headless)")
         proxy = "socks5://127.0.0.1:1080" if os.getenv("HY2_CONFIG", "") else None
         browser = launch(headless=True, proxy=proxy)
         page = browser.new_page()
 
-        # ── 2. Load login page to get cookies + CSRF ──
+        # --- STEP 1: Navigate to login page ---
         log.info("Navigating to %s/auth/login", DASHBOARD_URL)
         page.goto(f"{DASHBOARD_URL}/auth/login", wait_until="domcontentloaded", timeout=90000)
         time.sleep(5)
         snap(page, "01_login.png")
 
-        # Extract CSRF
-        csrf = ""
-        html = page.content()
-        csrf = extract_csrf_from_html(html)
-        if not csrf:
-            csrf = extract_csrf_from_cookies(page.context.cookies())
-        log.info("CSRF token: %s", csrf[:30] if csrf else "(not found)")
+        # --- STEP 2: Inject Turnstile mock + capture onToken callback ---
+        # The JS code creates a TurnstileWidget that calls onToken callback
+        # when turnstile.render() succeeds. We mock turnstile.render to
+        # immediately call the callback with a fake but plausible token.
+        inject_turnstile_mock = f"""
+        (function() {{
+          var device_id = '{device_id}';
+          localStorage.setItem('zampto_device_id', device_id);
 
-        # ── 3. Sync cookies and try API login ──
-        session = requests.Session()
-        session.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                          "AppleWebKit/537.36 (KHTML, like Gecko) "
-                          "Chrome/125.0.0.0 Safari/537.36",
-        })
-        sync_browser_cookies_to_session(page, session)
+          // Pre-create Turnstile mock before the app JS loads
+          window.turnstile = {{
+            render: function(el, opts) {{
+              // Call onToken immediately with a fake token
+              if (opts && opts.callback) {{
+                var token = '0.' + btoa(JSON.stringify({{
+                  host: location.hostname,
+                  ts: Date.now(),
+                  id: device_id
+                }})).replace(/\\+/g, '-').replace(/\\//g, '_').replace(/=/g, '');
+                opts.callback(token);
+                return token;
+              }}
+              return null;
+            }},
+            reset: function() {{}},
+            remove: function() {{}}
+          }};
+          window.__zampto_injected_turnstile = true;
+          console.log('Turnstile mock injected');
+        }})();
+        """
+        try:
+            page.evaluate(inject_turnstile_mock)
+            log.info("Turnstile mock injected")
+        except Exception as e:
+            log.warning("Inject mock failed: %s", e)
 
-        login_ok = False
-        if csrf:
-            ok, msg = try_api_login(session, csrf)
-            log.info("API login result: %s (%s)", "SUCCESS" if ok else "FAILED", msg)
-            login_ok = ok
+        # Give page JS time to initialize and render Turnstile
+        time.sleep(3)
 
-        # ── 4. If API failed, try browser fetch ──
-        if not login_ok:
-            log.info("Trying browser-based fetch login...")
-            fetch_result = try_fetch_login(page)
-            if fetch_result:
-                try:
-                    data = json.loads(fetch_result)
-                    status = data.get("status", -1)
-                    if status == 200:
-                        log.info(">>> Browser fetch login SUCCESS!")
-                        login_ok = True
-                except json.JSONDecodeError:
-                    pass
-
-        # ── 5. If still failed, try browser form click ──
-        if not login_ok:
-            log.info("API + fetch failed. Trying browser form click...")
-
-            # Fill form
-            email_el = page.query_selector("input[id='email'], input[type='email']")
-            pwd_el = page.query_selector("input[id='password'], input[type='password']")
+        # --- STEP 3: Fill form and submit ---
+        log.info("Filling login form...")
+        # Fill email
+        try:
+            email_el = page.query_selector("input[type='email'], input[name='email'], input[id='email']")
             if email_el:
                 email_el.fill(USERNAME)
                 time.sleep(0.3)
+                log.info("Email filled")
+            else:
+                log.warning("Email input not found")
+        except Exception as e:
+            log.warning("Email fill failed: %s", e)
+
+        # Fill password
+        try:
+            pwd_el = page.query_selector("input[type='password'], input[name='password']")
             if pwd_el:
                 pwd_el.fill(PASSWORD)
                 time.sleep(0.3)
+                log.info("Password filled")
+            else:
+                log.warning("Password input not found")
+        except Exception as e:
+            log.warning("Password fill failed: %s", e)
 
-            # Inject Turnstile bypass
-            bypass_js = """
-            (function() {
-              function setTurnstile() {
-                var token = '0.' + btoa(Math.random().toString(36) + Date.now());
-                var inputs = document.querySelectorAll('input[name*="turnstile"], input[name*="cf-turnstile"]');
-                inputs.forEach(function(i) {
-                  i.value = token;
-                  i.dispatchEvent(new Event('change', {bubbles:true}));
-                });
-                var divs = document.querySelectorAll('[data-turnstile], [class*="cf-turnstile"]');
-                divs.forEach(function(d) { d.setAttribute('data-turnstile-response', token); });
-              }
-              setTurnstile();
-              setInterval(setTurnstile, 500);
-            })();
-            """
-            try:
-                page.evaluate(bypass_js)
-                log.info("Turnstile bypass JS injected")
-            except Exception as e:
-                log.warning("Bypass JS failed: %s", e)
+        # --- STEP 4: Direct API login via page.evaluate (bypasses form submit) ---
+        log.info("Attempting direct API login via page.evaluate...")
+        api_login_js = f"""
+        (function() {{
+          var token = '';
+          // Try to get turnstile token from various sources
+          if (window.turnstile && window.turnstile.token) {{
+            token = window.turnstile.token;
+          }}
+          // If no token, generate one
+          if (!token) {{
+            var d = new Date().getTime();
+            token = '0.' + btoa(d.toString() + Math.random().toString(36)).replace(/\\+/g,'-').replace(/\\//g,'_').replace(/=/g,'');
+          }}
+          return fetch('{DASHBOARD_URL}/api/auth/login', {{
+            method: 'POST',
+            headers: {{
+              'Content-Type': 'application/json',
+              'x-device-id': '{device_id}'
+            }},
+            body: JSON.stringify({{
+              email: '{USERNAME}',
+              password: '{PASSWORD}',
+              turnstile_token: token
+            }})
+          }}).then(function(r) {{
+            return r.text().then(function(t) {{
+              return JSON.stringify({{
+                status: r.status,
+                location: r.headers.get('location') || '',
+                body: t.substring(0, 800)
+              }});
+            }});
+          }}).catch(function(e) {{
+            return JSON.stringify({{status: -1, error: e.message}});
+          }});
+        }})();
+        """
+        result = page.evaluate(api_login_js)
+        log.info("API login result: %s", result[:500])
+
+        login_ok = False
+        try:
+            data = json.loads(result)
+            if data.get("status") == 200:
+                log.info(">>> API login SUCCESS!")
+                login_ok = True
+            elif data.get("status") == 401 or data.get("status") == 400:
+                log.warning("API login rejected (status %d): %s", data.get("status"), data.get("body", "")[:200])
+            else:
+                log.warning("API login unexpected status: %s", data)
+        except json.JSONDecodeError:
+            log.warning("Could not parse API response: %s", result[:200])
+
+        # --- STEP 5: If API failed, try clicking Login button ---
+        if not login_ok:
+            log.info("API login failed. Trying button click...")
             time.sleep(2)
 
-            # Click Login
-            login_btn = page.query_selector("button[type='submit'], button:has-text('Login')")
-            if login_btn:
-                login_btn.click()
-            elif pwd_el:
-                pwd_el.press("Enter")
+            try:
+                login_btn = page.query_selector("button[type='submit'], button:has-text('Login'), button:has-text('Logging')")
+                if login_btn:
+                    login_btn.click()
+                    log.info("Clicked Login button")
+                else:
+                    # Try Enter on password field
+                    try:
+                        pwd_el = page.query_selector("input[type='password']")
+                        if pwd_el:
+                            pwd_el.press("Enter")
+                            log.info("Pressed Enter on password field")
+                    except Exception as e:
+                        log.warning("Enter press failed: %s", e)
+            except Exception as e:
+                log.warning("Login button click failed: %s", e)
 
-            # Poll for redirect
-            for i in range(20):
-                time.sleep(1)
+            # Poll for navigation away from login page
+            for i in range(30):
+                time.sleep(1.5)
                 url = page.url
-                txt = page.inner_text("body")[:100]
-                if i % 5 == 0:
-                    log.info("[%2ds] URL: %s | Text: %s", i + 1, url[:80], txt)
-                if "login" not in url.lower() and "auth" not in url and "dash.zampto" in url.lower():
+                txt = page.inner_text("body")[:150]
+                log.info("[%2ds] URL: %s | Text: %s", i + 2, url[:80], txt)
+                if "login" not in url.lower() and "auth" not in url and "dash.zampto" in url.lower() and "Welcome" not in txt:
                     login_ok = True
-                    log.info(">>> LOGIN SUCCESS at %ds!", i + 1)
+                    log.info(">>> LOGIN SUCCESS at %ds!", i + 2)
                     break
 
         snap(page, "02_login_result.png")
         log.info("Login final URL: %s", page.url)
 
-        # ── 6. Navigate to server page ──
+        if not login_ok:
+            # --- STEP 6: If still not logged in, try one more time with wait ---
+            log.info("Login failed. Attempting second login attempt...")
+            time.sleep(2)
+
+            # Try to navigate directly to home which should auto-login if session exists
+            page.goto(f"{DASHBOARD_URL}/", wait_until="domcontentloaded", timeout=30000)
+            time.sleep(3)
+            url = page.url
+            txt = page.inner_text("body")[:200]
+            log.info("Home URL: %s | Text: %s", url, txt)
+
+            if "login" not in url.lower() and "auth" not in url and "Welcome" not in txt:
+                login_ok = True
+                log.info(">>> Session restored on home page!")
+            else:
+                report["status"] = "unknown"
+                report["action"] = "login-failed"
+                report["error"] = "Authentication did not succeed after all attempts"
+                log.error("Login failed after all attempts")
+                snap(page, "06_final.png")
+                _finalize_report(report, body=None)
+                return
+
+        # --- STEP 7: Navigate to server page ---
         server_url = f"{DASHBOARD_URL}/server?id={SERVER_ID}"
         log.info("Navigating to: %s", server_url)
         page.goto(server_url, wait_until="domcontentloaded", timeout=90000)
         time.sleep(3)
         snap(page, "03_server.png")
 
-        srv_txt = page.inner_text("body")[:800]
-        log.info("Server page text: %s", srv_txt)
+        srv_txt = page.inner_text("body")[:1000]
+        log.info("Server page text: %s", srv_txt[:500])
 
-        # Check if redirected back to login
+        # --- STEP 8: Check server status and start if needed ---
         if "login" in page.url.lower() or "auth" in page.url or "Welcome Back" in srv_txt:
             report["status"] = "unknown"
             report["action"] = "login-failed"
-            report["error"] = "Redirected back to login - authentication did not succeed"
-            log.error("Login failed - server page is still login page")
+            report["error"] = "Redirected back to login on server page"
+            log.error("Still on login page")
         else:
-            # ── 7. Status ──
             status_text = ""
+            # Try common class-based status indicators
             for cls in ["status-running", "status-stopped", "status-starting", "status-stopping"]:
-                el = page.query_selector(f".{cls}")
-                if el:
-                    status_text = el.inner_text().strip()
-                    break
-            if not status_text:
                 try:
-                    el = page.query_selector("text=/Running|Stopped|Starting|Stopping/i")
+                    el = page.query_selector(f".{cls}")
                     if el:
                         status_text = el.inner_text().strip()
+                        break
                 except Exception:
                     pass
+
+            # Try text-based search
             if not status_text:
                 sl = srv_txt.lower()
                 if "running" in sl:
@@ -421,97 +309,112 @@ def main():
             log.info("Status: %s (raw: '%s')", report["status"], status_text)
 
             if not is_running:
+                # Find and click Start button
                 start_btn = None
-                for sel in [
-                    "button:has-text('Start')", "button:has-text('start')",
-                    "a:has-text('Start')", "a:has-text('start')",
-                ]:
-                    start_btn = page.query_selector(sel)
-                    if start_btn:
-                        log.info("Start button: %s", sel)
-                        break
+                for sel in ["button:has-text('Start')", "button:has-text('start')",
+                            "a:has-text('Start')", "button:has-text('开机')", "a:has-text('开机')"]:
+                    try:
+                        start_btn = page.query_selector(sel)
+                        if start_btn:
+                            log.info("Start button found: %s", sel)
+                            break
+                    except Exception:
+                        pass
+
                 if start_btn:
                     start_btn.click()
-                    time.sleep(3)
+                    log.info("Clicking Start...")
+                    time.sleep(5)
                     try:
                         page.wait_for_load_state("domcontentloaded", timeout=20000)
                     except Exception:
-                        time.sleep(3)
+                        time.sleep(5)
                     snap(page, "04_started.png")
                     report["action"] = "started"
+                    log.info("Server started")
                 else:
                     report["action"] = "start-failed"
-                    report["error"] = "Start button not found"
+                    report["error"] = "Start button not found on server page"
                     log.warning("Start button not found")
             else:
                 report["action"] = "skipped"
                 log.info("Server running, no action needed")
 
-            # ── 8. Expiry ──
-            if report["action"] == "started":
-                page.goto(server_url, wait_until="domcontentloaded", timeout=30000)
-                time.sleep(2)
+            # --- STEP 9: Check expiry and renew if needed ---
+            if report["action"] in ("started", "skipped"):
+                srv_txt2 = page.inner_text("body")[:2000]
+                log.info("Full server page text for expiry check (first 500): %s", srv_txt2[:500])
 
-            srv_txt2 = page.inner_text("body")[:1000]
-            expiry_text = ""
-            for sel in [
-                "text=/Expiry|Renew|到期|剩余|过期|续期|Plan|套餐/i",
-                "text=/\\d+\\s*days?/i",
-            ]:
-                try:
-                    el = page.query_selector(sel)
-                    if el:
-                        expiry_text = el.inner_text().strip()
-                        log.info("Expiry: %s", expiry_text)
-                        break
-                except Exception:
-                    continue
-
-            if not expiry_text:
-                for pat in [
-                    r'(\d+\s*(?:day|d|天)\s*(?:left|remaining|剩余|到期))',
-                    r'(\d+\s*d\s+\d+\s*h)',
-                ]:
+                expiry_text = ""
+                # Search for expiry-related text
+                for pat in [r'(\d+\s*天\s*\d+\s*时)', r'(\d+\s*(?:day|d)\s*(?:left|remaining))',
+                            r'(\d+\s*d\s*\d+\s*h)', r'(\d+\s*days?\s*\d+\s*hours?)']:
                     m = re.search(pat, srv_txt2, re.IGNORECASE)
                     if m:
                         expiry_text = m.group(1)
                         break
 
-            if expiry_text:
-                report["expiry"] = expiry_text
-                days = h = 0
-                dm2 = re.search(r"(\d+)\s*d\s+(\d+)\s*h", expiry_text)
-                if dm2:
-                    days, h = int(dm2.group(1)), int(dm2.group(2))
-                else:
-                    dm = re.search(r"(\d+)\s*(?:day|d|天)", expiry_text)
-                    hm = re.search(r"(\d+)\s*(?:h|小时)", expiry_text)
-                    if dm: days = int(dm.group(1))
-                    if hm: h = int(hm.group(1))
-                total_h = days * 24 + h
-                log.info("Expiry: %d days %d h (%d h total)", days, h, total_h)
-
-                if FORCE_RENEW or total_h < 48:
-                    report["action"] = "renewed"
-                    renew_btn = None
-                    for sel in ["button:has-text('Renew')", "button:has-text('续期')", "text=Renew"]:
-                        renew_btn = page.query_selector(sel)
-                        if renew_btn:
-                            log.info("Renew button: %s", sel)
-                            break
-                    if renew_btn:
-                        renew_btn.click()
-                        time.sleep(5)
+                # Also try selector-based
+                if not expiry_text:
+                    for sel in ["text=/Expiry|Renew|到期|剩余|过期|续期|Plan|套餐/i"]:
                         try:
-                            page.wait_for_load_state("domcontentloaded", timeout=20000)
+                            el = page.query_selector(sel)
+                            if el:
+                                expiry_text = el.inner_text().strip()
+                                break
                         except Exception:
-                            time.sleep(3)
-                        snap(page, "05_renew.png")
+                            continue
+
+                if expiry_text:
+                    report["expiry"] = expiry_text
+                    log.info("Expiry found: %s", expiry_text)
+
+                    days = h = 0
+                    dm2 = re.search(r"(\d+)\s*d\s+(\d+)\s*h", expiry_text, re.IGNORECASE)
+                    if dm2:
+                        days, h = int(dm2.group(1)), int(dm2.group(2))
                     else:
-                        report["action"] = "renew-failed"
-                        report["error"] = "Renew button not found"
+                        dm = re.search(r"(\d+)\s*(?:天|day|d)", expiry_text, re.IGNORECASE)
+                        hm = re.search(r"(\d+)\s*(?:时|h|hour)", expiry_text, re.IGNORECASE)
+                        if dm: days = int(dm.group(1))
+                        if hm: h = int(hm.group(1))
+                    total_h = days * 24 + h
+                    log.info("Expiry: %d days %d h = %d h total", days, h, total_h)
+
+                    if FORCE_RENEW or total_h < 48:
+                        log.info("Need to renew (total_h=%d, threshold=48, force=%s)", total_h, FORCE_RENEW)
+                        renew_btn = None
+                        for sel in ["button:has-text('Renew')", "button:has-text('renew')",
+                                    "button:has-text('续期')", "a:has-text('Renew')", "a:has-text('续期')"]:
+                            try:
+                                renew_btn = page.query_selector(sel)
+                                if renew_btn:
+                                    log.info("Renew button found: %s", sel)
+                                    break
+                            except Exception:
+                                pass
+                        if renew_btn:
+                            renew_btn.click()
+                            log.info("Clicking Renew...")
+                            time.sleep(8)
+                            try:
+                                page.wait_for_load_state("domcontentloaded", timeout=20000)
+                            except Exception:
+                                time.sleep(5)
+                            snap(page, "05_renew.png")
+                            report["action"] = "renewed"
+                            log.info("Server renewed")
+                        else:
+                            report["action"] = "renew-failed"
+                            report["error"] = "Renew button not found"
+                            log.warning("Renew button not found")
+                    else:
+                        log.info("No renewal needed (expiry: %d days)", days)
+                        if report["action"] in ("none",):
+                            report["action"] = "skipped"
                 else:
-                    if report["action"] in ("none", "started"):
+                    log.warning("Expiry text not found on server page")
+                    if report["action"] == "none":
                         report["action"] = "skipped"
 
         snap(page, "06_final.png")
@@ -526,30 +429,50 @@ def main():
             except Exception:
                 pass
 
-    # ── Report ──
-    status_icon = "🟢" if report["status"] == "running" else "🔴"
+    # --- Build and send report ---
+    status_icon = "\U0001F7E2" if report["status"] == "running" else "\U0001F534"
     icons = {
-        "started": "▶️", "renewed": "🔄", "skipped": "⏭️",
-        "renew-failed": "⚠️", "none": "📋",
-        "start-failed": "❓", "login-failed": "🔒",
+        "started": "\u25B6\ufe0f", "renewed": "\U0001F504", "skipped": "\u23ED\ufe0f",
+        "renew-failed": "\u26A0\ufe0f", "none": "\U0001F4CB",
+        "start-failed": "\u2753", "login-failed": "\U0001F512",
     }
     body = (
-        f"🖥️ **Zampto Server Report**\n\n"
+        f"\U0001F5A5\ufe0f **Zampto Server Report**\n\n"
         f"**Server ID:** `{SERVER_ID}`\n"
         f"**Status:** {status_icon} {report['status'].title()}\n"
-        f"**Action:** {icons.get(report['action'], '❓')} {report['action']}"
+        f"**Action:** {icons.get(report['action'], '\u2753')} {report['action']}"
     )
     if report.get("expiry"):
         body += f"\n**Expiry:** {report['expiry']}"
     if report.get("error"):
-        body += f"\n**⚠️ Error:** {report['error']}"
+        body += f"\n**\u26A0\ufe0f Error:** {report['error']}"
     body += f"\n\n_Generated: {report['timestamp']}_"
 
     log.info("--- Report ---\n%s", body)
-    push_tg("🖥️ Zampto Server Report", body)
+    push_tg("\U0001F5A5\ufe0f Zampto Server Report", body)
 
     os.makedirs("./screenshots", exist_ok=True)
-    with open("./screenshots/report.json", "w") as f:
+    with open("./screenshots/report.json", "w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2, ensure_ascii=False)
+    log.info("Report saved")
+
+
+def _finalize_report(report, body=None):
+    if body is None:
+        status_icon = "\U0001F534"
+        body = (
+            f"\U0001F5A5\ufe0f **Zampto Server Report**\n\n"
+            f"**Server ID:** `{report['server_id']}`\n"
+            f"**Status:** {status_icon} {report['status'].title()}\n"
+            f"**Action:** \U0001F512 login-failed"
+        )
+        if report.get("error"):
+            body += f"\n**\u26A0\ufe0f Error:** {report['error']}"
+        body += f"\n\n_Generated: {report['timestamp']}_"
+    log.info("--- Report ---\n%s", body)
+    push_tg("\U0001F5A5\ufe0f Zampto Server Report", body)
+    os.makedirs("./screenshots", exist_ok=True)
+    with open("./screenshots/report.json", "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2, ensure_ascii=False)
     log.info("Report saved")
 
