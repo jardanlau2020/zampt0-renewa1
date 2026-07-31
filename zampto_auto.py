@@ -128,35 +128,28 @@ def main():
         screenshot(page, "01_dashboard.png")
 
         # ── 3. Detect login page & handle Logto ─────────────────────────
+        # ── 3. Detect login page & handle Zampto login ─────────────────
         if "login" in page.url.lower():
             log.info("Login page detected, current URL: %s", page.url)
             screenshot(page, "02_login.png")
 
-            # Step A: Fill email
+            # ── Step A: Fill email ─────────────────────────────────────
             if wait_for(page, "input[name='email'], input[type='email'], input[name='username']",
                         15, "email input"):
                 email_input = page.query_selector(
                     "input[name='email'], input[type='email'], input[name='username']")
                 email_input.fill(USERNAME)
                 log.info("Email filled: %s", USERNAME)
-                email_input.press("Enter")
-                time.sleep(2)
+                time.sleep(1)
 
-            # Step B: Fill password
+            # ── Step B: Fill password ──────────────────────────────────
             if wait_for(page, "input[type='password']", 15, "password input"):
                 pwd_input = page.query_selector("input[type='password']")
                 pwd_input.fill(PASSWORD)
                 log.info("Password filled")
                 time.sleep(1)
 
-            # Step C: Wait for & solve Cloudflare Turnstile before submitting
-            log.info("Waiting for Cloudflare Turnstile widget...")
-            wait_for(page, "[data-sitekey], .cf-turnstile, [class*='turnstile']",
-                     30, "Cloudflare Turnstile")
-            time.sleep(10)  # Let CloakBrowser auto-solve Turnstile
-            screenshot(page, "03_turnstile_solved.png")
-
-            # Step D: Click Login button explicitly
+            # ── Step C: Find Login button ──────────────────────────────
             login_selectors = [
                 "button:has-text('Login')",
                 "button:has-text('login')",
@@ -175,35 +168,82 @@ def main():
                 except Exception:
                     continue
 
+            # ── Step D: Click Login & wait for Turnstile ───────────────
             if login_btn:
+                log.info("Clicking Login button")
                 login_btn.click()
-                log.info("Login button clicked")
             else:
                 log.info("Login button not found, pressing Enter on password field")
                 pwd_input.press("Enter")
 
-            time.sleep(4)
+            # ── Step E: Wait for Turnstile iframe + auto-solve ─────────
+            log.info("Waiting for Turnstile iframe to appear and auto-solve...")
+            time.sleep(3)
+            turnstile_found = wait_for(page, "iframe[src*='turnstile'], [class*='turnstile'], [data-sitekey], text=/Please complete/i",
+                                       60, "Turnstile widget")
+            if turnstile_found:
+                log.info("Turnstile widget found, waiting for CloakBrowser to auto-solve...")
+                time.sleep(15)  # Extended wait for Turnstile auto-solution
+
+            # ── Step F: Check result ───────────────────────────────────
+            time.sleep(3)
             page.wait_for_load_state("domcontentloaded", timeout=20000)
             screenshot(page, "03_post_login.png")
 
-            # Verify login succeeded
             post_login_url = page.url
-            post_login_text = page.inner_text("body")[:200]
+            post_login_text = page.inner_text("body")[:300]
             log.info("Post-login URL: %s", post_login_url)
             log.info("Post-login text: %s", post_login_text)
 
-            if "login" in post_login_url.lower() or "Welcome Back" in post_login_text:
-                log.warning("Login failed — still on login page! Check if Turnstile was solved.")
+            # Dump full HTML for debugging
+            html_debug = page.content()
+            log.info("[DEBUG] Full HTML length: %d chars", len(html_debug))
+
+            if "login" in post_login_url.lower() or "Welcome Back" in post_login_text or "security verification" in post_login_text:
+                log.warning("Login failed — still on login page. Dumping relevant HTML sections...")
                 screenshot(page, "03_login_failed.png")
-                # Try one more time: maybe just need to wait longer for Turnstile
-                time.sleep(5)
-                wait_for(page, "[data-sitekey], .cf-turnstile", 15, "Turnstile retry")
-                time.sleep(5)
+
+                # Check if Turnstile was marked as solved
+                turnstile_solved = "[x]" in html_debug.lower() or "solved" in html_debug.lower()
+                log.info("Turnstile appears solved in HTML: %s", turnstile_solved)
+
+                # Check for error messages
+                if "invalid" in post_login_text.lower() or "incorrect" in post_login_text.lower() or "error" in post_login_text.lower():
+                    log.error("Login rejected: %s", post_login_text[:200])
+                elif "security verification" in post_login_text.lower():
+                    log.warning("Turnstile not solved — Cloudflare verification pending")
+
+                # Try again with even longer Turnstile wait
+                log.info("Retry: waiting longer for Turnstile...")
+                time.sleep(20)
                 if login_btn:
                     login_btn.click()
-                    time.sleep(4)
-                    page.wait_for_load_state("domcontentloaded", timeout=20000)
-                    screenshot(page, "03_post_login_retry.png")
+                    time.sleep(20)
+                page.wait_for_load_state("domcontentloaded", timeout=20000)
+                screenshot(page, "03_post_login_retry.png")
+
+                post_login_url2 = page.url
+                post_login_text2 = page.inner_text("body")[:300]
+                log.info("Post-login URL (retry): %s", post_login_url2)
+                log.info("Post-login text (retry): %s", post_login_text2)
+
+                if "login" in post_login_url2.lower() or "Welcome Back" in post_login_text2:
+                    log.error("Login FAILED after 2 attempts. Screenshot: 03_post_login_retry.png")
+                    report["error"] = "Login failed — Turnstile verification could not be completed in headless mode"
+                    screenshot(page, "07_final.png")
+                    browser.close()
+                    push_tg("🖥️ Zampto Server Report", (
+                        f"🖥️ **Zampto Server Report**\n\n"
+                        f"**Server ID:** `{SERVER_ID}`\n"
+                        f"**Status:** 🔴 Failed\n"
+                        f"**Action:** ❌ login-failed\n"
+                        f"**⚠️ Error:** Login failed — Turnstile verification could not be completed.\n"
+                        f"Please check `03_post_login_retry.png` in Artifacts for details.\n\n"
+                        f"_Generated: {datetime.now(timezone.utc).isoformat()}_"))
+                    return
+            else:
+                log.info("Login SUCCESS! Dashboard loaded.")
+                screenshot(page, "03_login_success.png")
 
             server_url = f"{DASHBOARD_URL}/server?id={SERVER_ID}"
             page.goto(server_url, wait_until="domcontentloaded", timeout=90000)
