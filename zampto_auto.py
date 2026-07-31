@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Zampto Auto Renewal - CloakBrowser-based automation."""
+"""Zampto Auto Renewal - CloakBrowser + Turnstile API approach."""
 
 import os, re, sys, json, time, logging
 from datetime import datetime, timezone
@@ -17,6 +17,28 @@ DASHBOARD_URL = "https://dash.zampto.net"
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s")
 log = logging.getLogger("zampto")
 
+# ── Collect network requests ──
+captured = {"login_post": None, "responses": []}
+
+
+def capture_requests(browser):
+    """Use CDP to capture network requests during login."""
+    for ctx in browser.contexts:
+        for page in ctx.pages:
+            page.expose_function("capture", lambda *args: captured.update(args[0] if args else {}))
+            page.add_init_script("""
+window.__capture = {};
+const origFetch = window.fetch;
+window.fetch = function(url, opts) {
+    window.__capture.lastUrl = url;
+    window.__capture.lastOpts = opts;
+    return origFetch.apply(this, arguments).then(r => {
+        window.__capture.lastResponse = {ok: r.ok, status: r.status, url: r.url};
+        return r;
+    });
+}
+""")
+
 
 def push_tg(title, body):
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
@@ -31,83 +53,12 @@ def push_tg(title, body):
         log.error("Telegram failed: %s", e)
 
 
-def wait_for_sel(page, selector, timeout=30, label="element"):
-    try:
-        page.wait_for_selector(selector, timeout=timeout * 1000)
-        log.info("Found %s: %s", label, selector)
-        return True
-    except Exception:
-        log.warning("Timeout %s: %s", label, selector)
-        return False
-
-
 def snap(page, name, path="./screenshots"):
     os.makedirs(path, exist_ok=True)
     fp = os.path.join(path, name)
     page.screenshot(path=fp)
     log.info("Screenshot: %s", fp)
     return fp
-
-
-def parse_expiry(text):
-    text = text.strip()
-    days = h = m = 0
-    dm = re.search(r"(\d+)\s*day", text)
-    hm = re.search(r"(\d+)\s*h", text)
-    mm = re.search(r"(\d+)\s*m", text)
-    if dm:
-        days = int(dm.group(1))
-    if hm:
-        h = int(hm.group(1))
-    if mm:
-        m = int(mm.group(1))
-    log.info("Parsed expiry: %d days %d hours %d min", days, h, m)
-    return days, h, m, days * 24 + h
-
-
-def solve_turnstile(page):
-    """Find Cloudflare Turnstile iframe, click its checkbox, return True if solved."""
-    log.info("Waiting for Turnstile iframe...")
-    time.sleep(3)
-
-    for attempt in range(2):
-        cf_iframe = page.query_selector("iframe[src*='challenges.cloudflare.com'], iframe[src*='turnstile']")
-        if cf_iframe:
-            log.info("Turnstile iframe found (attempt %d)", attempt + 1)
-            try:
-                cf_frame = cf_iframe.content_frame()
-                if cf_frame:
-                    # Try multiple checkbox selectors inside the iframe
-                    checkbox = None
-                    for sel in ["[role='checkbox']", "[class*='checkbox']", "[class*='turnstile']",
-                                "input[type='checkbox']", "[class*='challenge']", "button"]:
-                        checkbox = cf_frame.query_selector(sel)
-                        if checkbox:
-                            log.info("  >>> Found checkbox in iframe: %s", sel)
-                            break
-                    if checkbox:
-                        # Try JS-native click first (triggers proper handlers)
-                        try:
-                            checkbox.evaluate("node => node.click()")
-                            log.info("  Clicked checkbox via JS")
-                        except Exception:
-                            checkbox.click()
-                            log.info("  Clicked checkbox via Playwright")
-                        time.sleep(10)
-                        log.info("Turnstile checkbox clicked, waiting for verification...")
-                        return True
-                    else:
-                        txt = cf_frame.text_content()[:200]
-                        log.info("  No checkbox found in iframe. Text: %s", txt)
-                else:
-                    log.info("  content_frame() returned None")
-            except Exception as e:
-                log.warning("  Failed to access Turnstile iframe: %s", e)
-        else:
-            log.info("Turnstile iframe not found (attempt %d), waiting...", attempt + 1)
-            time.sleep(3)
-
-    return False
 
 
 def main():
@@ -119,103 +70,167 @@ def main():
     log.info("Server ID: %s  |  Force: %s", SERVER_ID, FORCE_RENEW)
 
     report = {
-        "server_id": SERVER_ID,
-        "status": "unknown",
-        "action": "none",
-        "expiry": None,
-        "error": None,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "server_id": SERVER_ID, "status": "unknown", "action": "none",
+        "expiry": None, "error": None, "timestamp": datetime.now(timezone.utc).isoformat(),
     }
     browser = None
 
     try:
-        # ── 1. Launch ──
+        # ── 1. Launch CloakBrowser ──
         log.info("Launching CloakBrowser (headless)")
         proxy = "socks5://127.0.0.1:1080" if os.getenv("HY2_CONFIG", "") else None
         browser = launch(headless=True, proxy=proxy)
         page = browser.new_page()
+        capture_requests(browser)
 
-        # ── 2. Navigate ──
-        log.info("Navigating to %s", DASHBOARD_URL)
-        page.goto(DASHBOARD_URL, wait_until="domcontentloaded", timeout=90000)
-        time.sleep(3)
-        snap(page, "01_dashboard.png")
+        # ── 2. Navigate to login ──
+        log.info("Navigating to %s/auth/login", DASHBOARD_URL)
+        page.goto(f"{DASHBOARD_URL}/auth/login", wait_until="domcontentloaded", timeout=90000)
+        time.sleep(5)  # Let Turnstile load fully
+        snap(page, "01_login.png")
 
-        # ── 3. Login ──
-        login_ok = False
-        if "login" in page.url.lower():
-            log.info("Login page: %s", page.url)
-            snap(page, "02_login.png")
+        # ── 3. Inject monitoring script ──
+        page.add_init_script("""
+(function(){
+    window.__loginUrl = null;
+    window.__loginBody = null;
+    window.__loginHeaders = {};
+    const origFetch = window.fetch;
+    window.fetch = function(url, opts) {
+        if (url && typeof url === 'string') {
+            window.__loginUrl = url;
+            window.__loginBody = opts && opts.body;
+            window.__loginHeaders = {};
+            if (opts && opts.headers) {
+                if (opts.headers instanceof Headers) {
+                    opts.headers.forEach((v,k) => window.__loginHeaders[k] = v);
+                } else {
+                    for (const [k,v] of Object.entries(opts.headers)) {
+                        window.__loginHeaders[k] = v;
+                    }
+                }
+            }
+        }
+        return origFetch.apply(this, arguments);
+    };
 
-            # Email
-            if wait_for_sel(page, "input[name='email'], input[type='email'], input[name='username']", 15, "email"):
-                page.query_selector("input[name='email'], input[type='email'], input[name='username']").fill(USERNAME)
-                log.info("Email filled")
-                time.sleep(1)
+    // Also capture form submissions
+    document.addEventListener('submit', function(e) {
+        const form = e.target;
+        if (!form) return;
+        const formData = new FormData(form);
+        const entries = {};
+        for (const [k,v] of formData.entries()) entries[k] = v;
+        window.__formSubmitted = {url: form.action, data: entries};
+    }, true);
+})();
+""")
 
-            # Password
-            if wait_for_sel(page, "input[type='password']", 15, "password"):
-                pwd_input = page.query_selector("input[type='password']")
-                pwd_input.fill(PASSWORD)
-                log.info("Password filled")
-                time.sleep(1)
+        # ── 4. Fill login form ──
+        log.info("Filling login form...")
+        # Email
+        email_el = page.query_selector("input[id='email'], input[type='email']")
+        if email_el:
+            email_el.fill(USERNAME)
+            log.info("Email filled")
+            time.sleep(1)
 
-            # Login button
-            login_btn = None
-            for sel in ["button:has-text('Login')", "button:has-text('login')",
-                         "button[type='submit']", "text=Login", "text=登录"]:
+        # Password
+        pwd_el = page.query_selector("input[id='password'], input[type='password']")
+        if pwd_el:
+            pwd_el.fill(PASSWORD)
+            log.info("Password filled")
+            time.sleep(1)
+
+        # ── 5. Click Login ──
+        log.info("Clicking Login button")
+        login_btn = page.query_selector("button[type='submit']")
+        if login_btn:
+            login_btn.click()
+        else:
+            pwd_el.press("Enter")
+
+        # ── 6. Wait for Turnstile + capture ──
+        log.info("Waiting for Turnstile to load...")
+        time.sleep(8)
+
+        # Try to find Turnstile iframe
+        for attempt in range(3):
+            cf_iframe = page.query_selector("iframe[src*='challenges.cloudflare.com']")
+            if cf_iframe:
+                log.info("Turnstile iframe found (attempt %d)", attempt + 1)
                 try:
-                    login_btn = page.query_selector(sel)
-                    if login_btn:
-                        log.info("Login button found: %s", sel)
-                        break
-                except Exception:
-                    continue
-
-            if login_btn:
-                log.info("Clicking Login")
-                login_btn.click()
+                    cf_frame = cf_iframe.content_frame()
+                    if cf_frame:
+                        # Click checkbox
+                        checkbox = cf_frame.query_selector("[role='checkbox']")
+                        if not checkbox:
+                            checkbox = cf_frame.query_selector("[class*='checkbox'], [class*='challenge']")
+                        if checkbox:
+                            log.info(">>> Clicking Turnstile checkbox")
+                            checkbox.evaluate("node => node.click()")
+                            time.sleep(15)  # Wait for Cloudflare to verify
+                            log.info("Turnstile checkbox clicked, waiting for verification...")
+                            break
+                        else:
+                            log.info("No checkbox found in Turnstile frame")
+                except Exception as e:
+                    log.warning("Turnstile iframe access failed: %s", e)
             else:
-                pwd_input.press("Enter")
+                log.info("Turnstile iframe not found (attempt %d)", attempt + 1)
+                time.sleep(3)
 
-            # ── Solve Turnstile ──
-            turned = solve_turnstile(page)
+        # ── 7. Try clicking Login again ──
+        log.info("Clicking Login again")
+        lb2 = page.query_selector("button[type='submit']")
+        if lb2:
+            lb2.click()
+        else:
+            # Try clicking any Login button
+            page.evaluate("() => { const btns = document.querySelectorAll('button'); for (const b of btns) { if (b.textContent.includes('Login')) { b.click(); break; } } }")
 
-            # Click Login again if Turnstile was interacted with
-            if turned:
-                log.info("Turnstile solved, clicking Login again")
-                lb2 = page.query_selector("button:has-text('Login')")
-                if lb2:
-                    lb2.click()
-                    time.sleep(5)
+        # ── 8. Wait and check captured data ──
+        time.sleep(5)
+        page.wait_for_load_state("domcontentloaded", timeout=20000)
 
-            # Check result
+        # Check what API call was made
+        capture_result = page.evaluate("() => ({url: window.__loginUrl, body: window.__loginBody, headers: window.__loginHeaders, formSubmitted: window.__formSubmitted}))")
+        log.info("Captured request: %s", json.dumps(capture_result, default=str)[:500])
+
+        snap(page, "02_post_login.png")
+        url_now = page.url
+        txt_now = page.inner_text("body")[:300]
+        log.info("Post-login URL: %s", url_now)
+        log.info("Post-login text: %s", txt_now)
+
+        login_ok = ("login" not in url_now.lower() and "Welcome Back" not in txt_now and "security verification" not in txt_now)
+
+        if login_ok:
+            log.info(">>> LOGIN SUCCESS! <<<")
+            snap(page, "02_login_success.png")
+        else:
+            log.warning("Login FAILED — still on login page")
+            # Try one more approach: click Login with longer wait after Turnstile
+            log.info("Trying alternative: waiting longer for Turnstile auto-solve...")
+            time.sleep(15)
             page.wait_for_load_state("domcontentloaded", timeout=20000)
-            snap(page, "03_post_login.png")
-            url_now = page.url
-            txt_now = page.inner_text("body")[:300]
-            log.info("Post-login URL: %s", url_now)
-            log.info("Post-login text: %s", txt_now)
+            snap(page, "02_retry.png")
+            url2 = page.url
+            txt2 = page.inner_text("body")[:200]
+            log.info("Retry URL: %s | Text: %s", url2, txt2)
+            login_ok = ("login" not in url2.lower() and "Welcome Back" not in txt2)
 
-            if "login" not in url_now.lower() and "Welcome Back" not in txt_now:
-                log.info(">>> Login SUCCESS! <<<")
-                snap(page, "03_login_success.png")
-                login_ok = True
-            else:
-                log.warning("Login FAILED — still on login page")
-                snap(page, "03_login_failed.png")
+        if not login_ok:
+            log.warning("Login still failed after retry")
 
-        # ── 4. Server detail page ──
+        # ── 9. Go to server detail page ──
         server_url = f"{DASHBOARD_URL}/server?id={SERVER_ID}"
         log.info("Navigating to server: %s", server_url)
         page.goto(server_url, wait_until="domcontentloaded", timeout=90000)
         time.sleep(2)
-        snap(page, "04_server_detail.png")
+        snap(page, "03_server.png")
 
-        if not login_ok:
-            log.warning("Proceeding without confirmed login — status may be unreliable")
-
-        # ── 5. Server status ──
+        # ── 10. Check server status ──
         status_text = ""
         for cls in ["status-running", "status-stopped", "status-starting", "status-stopping"]:
             el = page.query_selector(f".{cls}")
@@ -231,14 +246,14 @@ def main():
         report["status"] = "running" if is_running else "stopped"
         log.info("Server status: %s", report["status"])
 
-        # ── 6. Start if stopped ──
+        # ── 11. Start if stopped ──
         if not is_running:
             log.info("Server stopped, trying to Start")
-            log.info("Page text (500): %s", page.inner_text("body")[:500])
+            page_text = page.inner_text("body")[:500]
+            log.info("Page text: %s", page_text)
             start_btn = None
             for sel in ["button:has-text('Start')", "button:has-text('start')",
-                         "a:has-text('Start')", "div:has-text('Start')",
-                         "button:has-text('启动')", "text=Start", "text=启动"]:
+                         "a:has-text('Start')", "div:has-text('Start')", "text=Start"]:
                 try:
                     start_btn = page.query_selector(sel)
                     if start_btn:
@@ -250,15 +265,15 @@ def main():
                 start_btn.click()
                 time.sleep(3)
                 page.wait_for_load_state("domcontentloaded", timeout=20000)
-                snap(page, "05_started.png")
+                snap(page, "04_started.png")
                 report["action"] = "started"
             else:
                 report["action"] = "start-failed"
                 report["error"] = "Start button not found"
 
-        # ── 7. Expiry & Renew ──
+        # ── 12. Check expiry & renew ──
         expiry_el = None
-        for sel in ["text=/Expiry|Renew|到期|剩余/i", "text=/Expire|过期|有效期/i",
+        for sel in ["text=/Expiry|Renew|到期|剩余/i", "text=/Expire|过期/i",
                      "text=/Plan|套餐/i", "text=/days|h/m/i", "text=/Remaining/i"]:
             try:
                 expiry_el = page.query_selector(sel)
@@ -271,15 +286,22 @@ def main():
         if expiry_el:
             expiry_text = expiry_el.inner_text()
             report["expiry"] = expiry_text
-            log.info("Expiry: %s", expiry_text)
-            days, hours, mins, total_h = parse_expiry(expiry_text)
+            days = h = m = 0
+            dm = re.search(r"(\d+)\s*day", expiry_text)
+            hm = re.search(r"(\d+)\s*h", expiry_text)
+            mm = re.search(r"(\d+)\s*m", expiry_text)
+            if dm: days = int(dm.group(1))
+            if hm: h = int(hm.group(1))
+            if mm: m = int(mm.group(1))
+            total_h = days * 24 + h
+            log.info("Expiry: %d days %d h (total %d h)", days, h, total_h)
+
             if FORCE_RENEW or total_h < 48:
-                log.info("Initiating renewal (days=%d hours=%d force=%s)", days, hours, FORCE_RENEW)
+                log.info("Initiating renewal")
                 report["action"] = "renewed"
                 renew_btn = None
                 for sel in ["button:has-text('Renew')", "button:has-text('续期')",
-                             "button:has-text('续费')", "a:has-text('Renew')",
-                             "text=Renew", "text=续期", "text=续费"]:
+                             "button:has-text('续费')", "text=Renew", "text=续期"]:
                     try:
                         renew_btn = page.query_selector(sel)
                         if renew_btn:
@@ -290,13 +312,8 @@ def main():
                 if renew_btn:
                     renew_btn.click()
                     time.sleep(2)
-                    wait_for_sel(page, "[data-sitekey], .cf-turnstile", 30, "turnstile")
-                    time.sleep(8)
                     page.wait_for_load_state("domcontentloaded", timeout=20000)
-                    snap(page, "06_renew.png")
-                    el2 = page.query_selector("text=/Expiry|到期/i")
-                    if el2:
-                        report["expiry"] = el2.inner_text()
+                    snap(page, "05_renew.png")
                 else:
                     report["action"] = "renew-failed"
                     report["error"] = "Renew button not found"
@@ -307,7 +324,7 @@ def main():
             report["error"] = "Expiry element not found"
             log.info("Page text (800): %s", page.inner_text("body")[:800])
 
-        snap(page, "07_final.png")
+        snap(page, "06_final.png")
 
     except Exception as e:
         report["error"] = str(e)
