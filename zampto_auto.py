@@ -113,13 +113,18 @@ def main():
     try:
         # ── 1. Launch CloakBrowser ──────────────────────────────────────
         log.info("Launching CloakBrowser (headless)")
-        browser = launch(headless=True)
+        proxy = None
+        hy2_config = os.getenv("HY2_CONFIG", "")
+        if hy2_config:
+            log.info("HY2_CONFIG detected, using SOCKS5 proxy via 127.0.0.1:1080")
+            proxy = "socks5://127.0.0.1:1080"
+        browser = launch(headless=True, proxy=proxy)
         page = browser.new_page()
 
         # ── 2. Navigate to Zampto Dashboard ─────────────────────────────
         log.info("Navigating to %s", DASHBOARD_URL)
-        page.goto(DASHBOARD_URL, wait_until="networkidle", timeout=60000)
-        time.sleep(2)
+        page.goto(DASHBOARD_URL, wait_until="domcontentloaded", timeout=90000)
+        time.sleep(3)
         screenshot(page, "01_dashboard.png")
 
         # ── 3. Detect login page & handle Logto ─────────────────────────
@@ -127,7 +132,6 @@ def main():
             log.info("Login page detected")
             screenshot(page, "02_login.png")
 
-            # Step 1: Enter email/username
             if wait_for(page, "input[name='email'], input[type='email'], input[name='username']",
                         15, "email input"):
                 email_input = page.query_selector(
@@ -136,24 +140,22 @@ def main():
                 email_input.press("Enter")
                 time.sleep(1)
 
-            # Step 2: Enter password
             if wait_for(page, "input[type='password']", 15, "password input"):
                 pwd_input = page.query_selector("input[type='password']")
                 pwd_input.fill(PASSWORD)
                 pwd_input.press("Enter")
                 time.sleep(3)
 
-            page.wait_for_load_state("networkidle", timeout=15000)
+            page.wait_for_load_state("domcontentloaded", timeout=20000)
             screenshot(page, "03_post_login.png")
 
-            # ── 4. Navigate to server detail ────────────────────────────
             server_url = f"{DASHBOARD_URL}/server?id={SERVER_ID}"
-            page.goto(server_url, wait_until="networkidle", timeout=60000)
+            page.goto(server_url, wait_until="domcontentloaded", timeout=90000)
             time.sleep(2)
             screenshot(page, "04_server_detail.png")
         else:
             server_url = f"{DASHBOARD_URL}/server?id={SERVER_ID}"
-            page.goto(server_url, wait_until="networkidle", timeout=60000)
+            page.goto(server_url, wait_until="domcontentloaded", timeout=90000)
             time.sleep(2)
             screenshot(page, "04_server_detail.png")
 
@@ -181,7 +183,7 @@ def main():
             if start_btn:
                 start_btn.click()
                 time.sleep(3)
-                page.wait_for_load_state("networkidle", timeout=20000)
+                page.wait_for_load_state("domcontentloaded", timeout=20000)
                 screenshot(page, "05_server_started.png")
                 report["action"] = "started"
                 log.info("Server start clicked")
@@ -209,7 +211,6 @@ def main():
                     renew_btn.click()
                     time.sleep(2)
 
-                    # Wait for Cloudflare Turnstile
                     log.info("Waiting for Cloudflare Turnstile...")
                     wait_for(page, "[data-sitekey], .cf-turnstile", 30, "turnstile")
                     time.sleep(8)
@@ -220,7 +221,7 @@ def main():
                         confirm.click()
                         time.sleep(3)
 
-                    page.wait_for_load_state("networkidle", timeout=20000)
+                    page.wait_for_load_state("domcontentloaded", timeout=20000)
                     screenshot(page, "06_after_renew.png")
 
                     expiry_el2 = page.query_selector("text=/Expiry|到期/i")
@@ -277,6 +278,7 @@ def main():
     log.info("--- Report ---\n%s", body)
     push_tg("🖥️ Zampto Server Report", body)
 
+    os.makedirs("./screenshots", exist_ok=True)
     with open("./screenshots/report.json", "w") as f:
         json.dump(report, f, indent=2)
     log.info("Report saved to ./screenshots/report.json")
