@@ -388,7 +388,7 @@ def main():
         else:
             log.info("No session file found - will use interactive login")
 
-    # Mode C: No session available – FAIL (GitHub should have secret)
+    # Mode C: No session available – FAIL
     if not cookies:
         log.error("No valid authentication available - cannot proceed")
         reason = "Missing ZAMPTO_SESSION_SECRET (GitHub) OR missing ./screenshots/session.json (local)"
@@ -399,7 +399,7 @@ def main():
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
         _report(report)
-        return
+        sys.exit(1)  # Non-zero exit so workflow marks as failure
 
     # Execute API renewal with the loaded cookies
     log.info("Starting API-based server status check & renewal...")
