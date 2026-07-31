@@ -124,29 +124,54 @@ def find_csrf_cookie(cookies):
 
 
 def refresh_csrf_token(api_session, base_url=DASHBOARD_URL, server_id=None):
-    """Get the latest CSRF token from session cookies.
+    """Get the latest CSRF token from server response.
 
     Per the Zampto dashboard JS (getCsrfCookie / getCsrfToken in HTML):
-      - Token = full zampto_csrf cookie value (NOT split, NOT decoded separately)
+      - Token = full zampto_csrf cookie value
       - Sent via X-CSRF-Token header on every non-GET request
       - Server issues a NEW cookie on every response (old value expires immediately)
 
-    Therefore: we must fetch the LATEST cookie value right before each POST.
-    A simple GET request triggers Set-Cookie with the new value, and
-    requests.Session auto-updates api_session.cookies.
+    IMPORTANT: We read Set-Cookie header DIRECTLY from response.raw.headers.getlist,
+    because requests.Session's cookie jar sometimes keeps stale value if domain/path
+    don't exactly match. Multiple Set-Cookie headers may be merged into one dict entry.
     """
     try:
         # Trigger a fresh Set-Cookie by hitting any endpoint
         r = api_session.get(f"{base_url}/api/servers", timeout=10)
         log.info("  Triggered CSRF refresh via /api/servers (status=%d)", r.status_code)
 
-        # Read latest cookie value from session
+        # Read Set-Cookie headers DIRECTLY from raw response (most reliable)
+        try:
+            set_cookies = r.raw.headers.getlist("Set-Cookie")
+        except (AttributeError, KeyError):
+            set_cookies = []
+            # Fallback to single header
+            if "Set-Cookie" in r.headers:
+                set_cookies.append(r.headers["Set-Cookie"])
+
+        for sc in set_cookies:
+            lower_sc = sc.lower()
+            if "zampto_csrf=" in lower_sc:
+                # Extract value between "zampto_csrf=" and first ";"
+                idx = lower_sc.index("zampto_csrf=") + len("zampto_csrf=")
+                rest = sc[idx:]
+                end = rest.find(";")
+                token = rest if end == -1 else rest[:end]
+                token = token.strip()
+                if token:
+                    log.info("  ✓ Fresh CSRF from Set-Cookie header (length=%d)", len(token))
+                    # Also update session.cookies so subsequent requests send the right cookie
+                    api_session.cookies.set("zampto_csrf", token, domain=".zampto.net", path="/")
+                    return token
+
+        # Fallback: read from session.cookies
+        log.warning("  No Set-Cookie with zampto_csrf in response, using session.cookies")
         for c in api_session.cookies:
             if "csrf" in c.name.lower():
-                log.info("  ✓ Latest CSRF token from cookie (length=%d)", len(c.value))
+                log.info("  ✓ CSRF from session.cookies (length=%d)", len(c.value))
                 return c.value
 
-        log.warning("  No CSRF cookie in session after refresh")
+        log.warning("  No CSRF cookie found anywhere")
         return None
     except Exception as e:
         log.warning("  CSRF refresh failed: %s", e)
