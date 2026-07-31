@@ -546,10 +546,14 @@ def phase_api_renewal(use_cookies=None):
                 if should_renew:
                     log.info("Renewing server (%d h left, threshold: 48h)", total_h)
                     renewed = False
+                    # Path list - put the confirmed correct one first
+                    # User confirmed: POST /api/server/renew (singular, no ID in URL)
+                    # Body should contain server_id
                     renew_paths = []
                     if server_identifier:
                         renew_paths.append(f"/api/client/servers/{server_identifier}/renew")
                     renew_paths.extend([
+                        "/api/server/renew",                  # ← confirmed correct path (POST with body)
                         f"/api/servers/{SERVER_ID}/renew",
                         f"/api/server/{SERVER_ID}/renew",
                         f"{used_path}/renew",
@@ -566,9 +570,15 @@ def phase_api_renewal(use_cookies=None):
                             log.warning("  Could not refresh CSRF, skipping this path")
                             continue
 
+                        # Body should include server_id for paths that don't have it in URL
+                        # (especially /api/server/renew which is the confirmed correct path)
+                        post_body = {}
+                        if renew_path in ("/api/server/renew", "/api/servers/renew", "/api/renew"):
+                            post_body = {"server_id": int(SERVER_ID) if SERVER_ID.isdigit() else SERVER_ID}
+                            log.info("  POST body: %s", post_body)
                         resp = api_session.post(
                             renew_url,
-                            json={},
+                            json=post_body,
                             timeout=15,
                             headers={"X-CSRF-Token": fresh_csrf},
                         )
