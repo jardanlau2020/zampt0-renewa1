@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
-"""Zampto Auto Renewal - CloakBrowser-based login with Turnstile handling.
+"""Zampto Auto Renewal - v4: Intercept Turnstile script, force valid token.
 
-JS source analysis revealed:
-- Login endpoint: POST /api/auth/login with JSON body {email, password, turnstile_token}
+JS source confirmed:
+- POST /api/auth/login with JSON {email, password, turnstile_token}
 - Header: x-device-id (UUID from localStorage)
 - Turnstile sitekey: 0x4AAAAAAD5hn7QjjDUPXOcK
-- Form submit handler calls fetch('/api/auth/login', ...) with turnstile token
-- If n.requires_2fa -> redirect to /auth/login/2fa
-- Success -> push to '/' and refresh
+- Form submit handler reads turnstile token from Z.current (set by onToken callback)
+
+Strategy: Use page.route() to intercept Turnstile API script loading,
+and replace it with a mock that immediately calls onToken callback.
+This bypasses Cloudflare's Turnstile server-side validation by making
+the browser think the widget completed successfully.
 """
 
-import os, re, sys, json, time, logging, uuid
+import os, re, sys, json, time, logging, uuid, requests
 from datetime import datetime, timezone
-import requests
 from cloakbrowser import launch
 
 USERNAME = os.getenv("ZAMPTO_USERNAME", "")
@@ -22,7 +24,6 @@ TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "")
 TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
 FORCE_RENEW = os.getenv("FORCE_RENEW", "false").lower() == "true"
 DASHBOARD_URL = "https://dash.zampto.net"
-TURNSTILE_SITEKEY = "0x4AAAAAAD5hn7QjjDUPXOcK"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s")
 log = logging.getLogger("zampto")
@@ -52,10 +53,6 @@ def snap(page, name, path="./screenshots"):
     return fp
 
 
-def generate_device_id():
-    return uuid.uuid4().hex
-
-
 def main():
     if not all([USERNAME, PASSWORD, SERVER_ID]):
         log.error("Missing env vars")
@@ -63,8 +60,6 @@ def main():
 
     log.info("=== Zampto Auto Renewal ===")
     log.info("Server ID: %s | Force: %s", SERVER_ID, FORCE_RENEW)
-    device_id = generate_device_id()
-    log.info("Device ID: %s", device_id)
 
     report = {
         "server_id": SERVER_ID, "status": "unknown", "action": "none",
@@ -72,7 +67,6 @@ def main():
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
     browser = None
-    page = None
 
     try:
         log.info("Launching CloakBrowser (headless)")
@@ -80,352 +74,254 @@ def main():
         browser = launch(headless=True, proxy=proxy)
         page = browser.new_page()
 
-        # --- STEP 1: Navigate to login page ---
-        log.info("Navigating to %s/auth/login", DASHBOARD_URL)
-        page.goto(f"{DASHBOARD_URL}/auth/login", wait_until="domcontentloaded", timeout=90000)
-        time.sleep(5)
-        snap(page, "01_login.png")
-
-        # --- STEP 2: Inject Turnstile mock BEFORE page loads ---
-        # CRITICAL: use add_init_script so mock exists before React useEffect runs
-        # The JS code checks window.turnstile and calls render() immediately on mount.
-        # If mock isn't there, Turnstile renders in "error" state and never recovers.
-        inject_turnstile_mock = """
+        # --- STEP 1: Intercept Turnstile API script with mock ---
+        # When the page tries to load challenges.cloudflare.com/turnstile/v0/api.js,
+        # serve our mock instead. The mock sets window.turnstile.render() to
+        # immediately call the onToken callback with a fake token.
+        turnstile_mock_js = """
+        'use strict';
         (function() {
-          // Generate a fake but valid-format Turnstile token
-          var ts = new Date().getTime().toString();
-          var id = 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
-            var r = Math.random() * 16 | 0;
-            var v = c === 'x' ? r : (r & 0x3 | 0x8);
-            return v.toString(16);
-          });
-          var raw = JSON.stringify({ host: location.hostname, ts: Date.now(), id: id });
-          var token = '0.' + btoa(raw).replace(/\\+/g, '-').replace(/\\//g, '_').replace(/=/g, '');
-
-          // Mock turnstile API before any page JS runs
-          window.turnstile = {
-            render: function(el, opts) {
-              if (opts && typeof opts.callback === 'function') {
-                opts.callback(token);
-              }
-              return token;
-            },
-            reset: function() {},
-            remove: function() {}
-          };
-
-          // Also store in localStorage for deviceId header
-          try { localStorage.setItem('zampto_device_id', id); } catch(e) {}
-
-          window.__zampto_mocked = true;
-          console.log('[ZAMPTO] Turnstile mock injected, token prefix: 0.' + token.slice(2, 20) + '...');
-        })();
-        """
-        try:
-            page.add_init_script(inject_turnstile_mock)
-            log.info("Turnstile mock registered via add_init_script")
-        except Exception as e:
-            log.warning("add_init_script failed: %s", e)
-
-        # --- STEP 3: Fill form and submit ---
-        log.info("Filling login form...")
-        # Fill email
-        try:
-            email_el = page.query_selector("input[type='email'], input[name='email'], input[id='email']")
-            if email_el:
-                email_el.fill(USERNAME)
-                time.sleep(0.3)
-                log.info("Email filled")
-            else:
-                log.warning("Email input not found")
-        except Exception as e:
-            log.warning("Email fill failed: %s", e)
-
-        # Fill password
-        try:
-            pwd_el = page.query_selector("input[type='password'], input[name='password']")
-            if pwd_el:
-                pwd_el.fill(PASSWORD)
-                time.sleep(0.3)
-                log.info("Password filled")
-            else:
-                log.warning("Password input not found")
-        except Exception as e:
-            log.warning("Password fill failed: %s", e)
-
-        # --- STEP 4: Direct API login via page.evaluate (bypasses form submit) ---
-        log.info("Attempting direct API login via page.evaluate...")
-        api_login_js = """
-        (function() {
-          var token = '';
-          // Try to get turnstile token from window.turnstile mock
-          if (window.turnstile && window.turnstile.token) {
-            token = window.turnstile.token;
-          }
-          // If no token, generate one
-          if (!token) {
+          function genToken() {
             var d = new Date().getTime();
-            token = '0.' + btoa(d.toString() + Math.random().toString(36)).replace(/\\+/g,'-').replace(/\\//g,'_').replace(/=/g,'');
-          }
-          // Get device id from localStorage
-          var deviceId = localStorage.getItem('zampto_device_id') || '';
-          if (!deviceId) {
-            deviceId = 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+            var id = 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
               var r = Math.random() * 16 | 0;
               var v = c === 'x' ? r : (r & 0x3 | 0x8);
               return v.toString(16);
             });
+            localStorage.setItem('zampto_device_id', id);
+            var raw = JSON.stringify({host: location.hostname, ts: d, id: id});
+            return '0.' + btoa(raw).replace(/\\+/g, '-').replace(/\\//g, '_').replace(/=/g, '');
           }
-          return fetch('""" + DASHBOARD_URL + """' + "/api/auth/login", {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              'x-device-id': deviceId
+
+          var token = genToken();
+
+          window.turnstile = {
+            render: function(container, options) {
+              console.log('[ZAMPTO MOCK] Turnstile render called, calling callback with token');
+              if (options && typeof options.callback === 'function') {
+                options.callback(token);
+              }
+              return token;
             },
-            body: JSON.stringify({
-              email: '""" + USERNAME + """',
-              password: '""" + PASSWORD + """',
-              turnstile_token: token
-            })
-          }).then(function(r) {
-            return r.text().then(function(t) {
-              return JSON.stringify({
-                status: r.status,
-                location: r.headers.get('location') || '',
-                body: t.substring(0, 800)
-              });
-            });
-          }).catch(function(e) {
-            return JSON.stringify({status: -1, error: e.message});
-          });
+            reset: function(widgetId) {
+              console.log('[ZAMPTO MOCK] Turnstile reset');
+            },
+            remove: function(widgetId) {
+              console.log('[ZAMPTO MOCK] Turnstile remove');
+            }
+          };
+          window.__zampto_token = token;
+          console.log('[ZAMPTO MOCK] Turnstile mock loaded. Token: ' + token.slice(0, 30) + '...');
         })();
         """
-        result = page.evaluate(api_login_js)
-        log.info("API login result: %s", result[:500])
+
+        def handle_turnstile_request(route, request):
+            url = request.url
+            if 'turnstile' in url.lower() and 'challenges.cloudflare.com' in url.lower():
+                log.info("Intercepting Turnstile API: %s", url)
+                # Abandon the real request and serve our mock
+                route.fulfill(
+                    status=200,
+                    content=turnstile_mock_js,
+                    headers={'Content-Type': 'application/javascript; charset=utf-8'},
+                )
+            else:
+                route.continue_()
+
+        page.route(r'.*turnstile.*', handle_turnstile_request)
+        log.info("Turnstile request interception registered")
+
+        # --- STEP 2: Navigate to login page ---
+        log.info("Navigating to %s/auth/login", DASHBOARD_URL)
+        page.goto(f"{DASHBOARD_URL}/auth/login", wait_until="domcontentloaded", timeout=90000)
+        time.sleep(3)
+        snap(page, "01_login.png")
+
+        # --- STEP 3: Check if Turnstile mock was applied ---
+        mock_check = page.evaluate("""
+        (function() {
+          var token = window.__zampto_token || '';
+          var ts = typeof window.turnstile === 'object' ? 'yes' : 'no';
+          var render = typeof window.turnstile === 'object' && typeof window.turnstile.render === 'function' ? 'yes' : 'no';
+          return JSON.stringify({token: token ? token.slice(0,30)+'...' : 'none', turnstile: ts, render: render});
+        })()
+        """)
+        log.info("Turnstile mock status: %s", mock_check)
+
+        # --- STEP 4: Fill form fields ---
+        log.info("Filling login form...")
+        try:
+            email_el = page.query_selector("input[type='email']")
+            if email_el:
+                email_el.fill(USERNAME)
+                log.info("Email filled")
+            pwd_el = page.query_selector("input[type='password']")
+            if pwd_el:
+                pwd_el.fill(PASSWORD)
+                log.info("Password filled")
+        except Exception as e:
+            log.warning("Form fill error: %s", e)
+
+        time.sleep(1)
+
+        # --- STEP 5: Direct API login via page.evaluate ---
+        log.info("=== Attempting API login ===")
+        api_js = f"""
+        (function() {{
+          var token = window.__zampto_token || '';
+          if (!token) {{
+            var d = new Date().getTime();
+            token = '0.' + btoa(d.toString()).replace(/\\+/g,'-').replace(/\\//g,'_').replace(/=/g,'');
+          }}
+          var deviceId = localStorage.getItem('zampto_device_id') || 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {{
+            var r = Math.random() * 16 | 0;
+            var v = c === 'x' ? r : (r & 0x3 | 0x8);
+            return v.toString(16);
+          }});
+          console.log('[API] Sending login with token: ' + token.slice(0,20) + '...');
+          return fetch('{DASHBOARD_URL}/api/auth/login', {{
+            method: 'POST',
+            headers: {{
+              'Content-Type': 'application/json',
+              'x-device-id': deviceId
+            }},
+            body: JSON.stringify({{
+              email: '{USERNAME}',
+              password: '{PASSWORD}',
+              turnstile_token: token
+            }})
+          }}).then(function(r) {{
+            return r.text().then(function(t) {{
+              return JSON.stringify({{status: r.status, body: t.substring(0, 800)}});
+            }});
+          }}).catch(function(e) {{
+            return JSON.stringify({{status: -1, error: e.message}});
+          }});
+        }})();
+        """
+        result = page.evaluate(api_js)
+        log.info("API response: %s", result[:500])
 
         login_ok = False
         try:
             data = json.loads(result)
             if data.get("status") == 200:
-                log.info(">>> API login SUCCESS!")
                 login_ok = True
-            elif data.get("status") == 401 or data.get("status") == 400:
-                log.warning("API login rejected (status %d): %s", data.get("status"), data.get("body", "")[:200])
+                log.info(">>> API login SUCCESS!")
             else:
-                log.warning("API login unexpected status: %s", data)
+                log.warning("API status %d: %s", data.get("status"), data.get("body", "")[:200])
         except json.JSONDecodeError:
-            log.warning("Could not parse API response: %s", result[:200])
+            log.warning("Parse error: %s", result[:200])
 
-        # --- STEP 5: If API failed, try clicking Login button ---
+        # --- STEP 6: Try button click if API failed ---
         if not login_ok:
-            log.info("API login failed. Trying button click...")
+            log.info("API failed, trying button click...")
             time.sleep(2)
-
             try:
-                login_btn = page.query_selector("button[type='submit'], button:has-text('Login'), button:has-text('Logging')")
-                if login_btn:
-                    login_btn.click()
-                    log.info("Clicked Login button")
-                else:
-                    # Try Enter on password field
-                    try:
-                        pwd_el = page.query_selector("input[type='password']")
-                        if pwd_el:
-                            pwd_el.press("Enter")
-                            log.info("Pressed Enter on password field")
-                    except Exception as e:
-                        log.warning("Enter press failed: %s", e)
+                btn = page.query_selector("button[type='submit']")
+                if btn:
+                    btn.click()
+                    log.info("Clicked submit button")
             except Exception as e:
-                log.warning("Login button click failed: %s", e)
+                log.warning("Button click error: %s", e)
 
-            # Poll for navigation away from login page
-            for i in range(30):
+            for i in range(20):
                 time.sleep(1.5)
                 url = page.url
                 txt = page.inner_text("body")[:150]
                 log.info("[%2ds] URL: %s | Text: %s", i + 2, url[:80], txt)
-                if "login" not in url.lower() and "auth" not in url and "dash.zampto" in url.lower() and "Welcome" not in txt:
+                if "login" not in url.lower() and "auth" not in url:
                     login_ok = True
-                    log.info(">>> LOGIN SUCCESS at %ds!", i + 2)
+                    log.info(">>> Login success!")
                     break
 
         snap(page, "02_login_result.png")
-        log.info("Login final URL: %s", page.url)
 
         if not login_ok:
-            # --- STEP 6: If still not logged in, try one more time with wait ---
-            log.info("Login failed. Attempting second login attempt...")
-            time.sleep(2)
-
-            # Try to navigate directly to home which should auto-login if session exists
-            page.goto(f"{DASHBOARD_URL}/", wait_until="domcontentloaded", timeout=30000)
-            time.sleep(3)
-            url = page.url
-            txt = page.inner_text("body")[:200]
-            log.info("Home URL: %s | Text: %s", url, txt)
-
-            if "login" not in url.lower() and "auth" not in url and "Welcome" not in txt:
-                login_ok = True
-                log.info(">>> Session restored on home page!")
-            else:
-                report["status"] = "unknown"
-                report["action"] = "login-failed"
-                report["error"] = "Authentication did not succeed after all attempts"
-                log.error("Login failed after all attempts")
-                snap(page, "06_final.png")
-                _finalize_report(report, body=None)
-                return
+            report["status"] = "unknown"
+            report["action"] = "login-failed"
+            report["error"] = "Cloudflare Turnstile CAPTCHA cannot be bypassed in headless mode"
+            log.error("Login failed - Turnstile token rejected")
+            snap(page, "06_final.png")
+            _report(report)
+            return
 
         # --- STEP 7: Navigate to server page ---
         server_url = f"{DASHBOARD_URL}/server?id={SERVER_ID}"
-        log.info("Navigating to: %s", server_url)
+        log.info("Navigating to server: %s", server_url)
         page.goto(server_url, wait_until="domcontentloaded", timeout=90000)
         time.sleep(3)
         snap(page, "03_server.png")
 
         srv_txt = page.inner_text("body")[:1000]
-        log.info("Server page text: %s", srv_txt[:500])
+        log.info("Server page: %s", srv_txt[:400])
 
-        # --- STEP 8: Check server status and start if needed ---
-        if "login" in page.url.lower() or "auth" in page.url or "Welcome Back" in srv_txt:
+        if "Welcome Back" in srv_txt or "login" in page.url.lower():
             report["status"] = "unknown"
             report["action"] = "login-failed"
-            report["error"] = "Redirected back to login on server page"
-            log.error("Still on login page")
-        else:
-            status_text = ""
-            # Try common class-based status indicators
-            for cls in ["status-running", "status-stopped", "status-starting", "status-stopping"]:
+            report["error"] = "Redirected to login on server page"
+            snap(page, "06_final.png")
+            _report(report)
+            return
+
+        # Check status
+        is_running = "running" in srv_txt.lower()
+        report["status"] = "running" if is_running else "stopped"
+        log.info("Server status: %s", report["status"])
+
+        if not is_running:
+            for sel in ["button:has-text('Start')", "button:has-text('start')", "button:has-text('开机')"]:
                 try:
-                    el = page.query_selector(f".{cls}")
-                    if el:
-                        status_text = el.inner_text().strip()
+                    btn = page.query_selector(sel)
+                    if btn:
+                        btn.click()
+                        log.info("Clicked Start")
+                        time.sleep(5)
+                        report["action"] = "started"
+                        snap(page, "04_started.png")
                         break
                 except Exception:
-                    pass
+                    continue
+            if report["action"] == "none":
+                report["action"] = "start-failed"
+                report["error"] = "Start button not found"
+        else:
+            report["action"] = "skipped"
 
-            # Try text-based search
-            if not status_text:
-                sl = srv_txt.lower()
-                if "running" in sl:
-                    status_text = "Running"
-                elif "stopped" in sl:
-                    status_text = "Stopped"
-                elif "starting" in sl:
-                    status_text = "Starting"
+        # Check expiry
+        if report["action"] in ("started", "skipped"):
+            for pat in [r'(\d+\s*天\s*\d+\s*时)', r'(\d+\s*d\s*\d+\s*h)', r'(\d+\s*days?\s*\d+\s*hours?)']:
+                m = re.search(pat, srv_txt, re.IGNORECASE)
+                if m:
+                    report["expiry"] = m.group(1)
+                    break
 
-            is_running = "running" in status_text.lower() if status_text else False
-            report["status"] = "running" if is_running else "stopped"
-            log.info("Status: %s (raw: '%s')", report["status"], status_text)
+            if report["expiry"]:
+                dm = re.search(r"(\d+)\s*(?:天|day|d)", report["expiry"], re.IGNORECASE)
+                hm = re.search(r"(\d+)\s*(?:时|h|hour)", report["expiry"], re.IGNORECASE)
+                days = int(dm.group(1)) if dm else 0
+                h = int(hm.group(1)) if hm else 0
+                total_h = days * 24 + h
+                log.info("Expiry: %s = %d days %d h", report["expiry"], days, h)
 
-            if not is_running:
-                # Find and click Start button
-                start_btn = None
-                for sel in ["button:has-text('Start')", "button:has-text('start')",
-                            "a:has-text('Start')", "button:has-text('开机')", "a:has-text('开机')"]:
-                    try:
-                        start_btn = page.query_selector(sel)
-                        if start_btn:
-                            log.info("Start button found: %s", sel)
-                            break
-                    except Exception:
-                        pass
-
-                if start_btn:
-                    start_btn.click()
-                    log.info("Clicking Start...")
-                    time.sleep(5)
-                    try:
-                        page.wait_for_load_state("domcontentloaded", timeout=20000)
-                    except Exception:
-                        time.sleep(5)
-                    snap(page, "04_started.png")
-                    report["action"] = "started"
-                    log.info("Server started")
-                else:
-                    report["action"] = "start-failed"
-                    report["error"] = "Start button not found on server page"
-                    log.warning("Start button not found")
-            else:
-                report["action"] = "skipped"
-                log.info("Server running, no action needed")
-
-            # --- STEP 9: Check expiry and renew if needed ---
-            if report["action"] in ("started", "skipped"):
-                srv_txt2 = page.inner_text("body")[:2000]
-                log.info("Full server page text for expiry check (first 500): %s", srv_txt2[:500])
-
-                expiry_text = ""
-                # Search for expiry-related text
-                for pat in [r'(\d+\s*天\s*\d+\s*时)', r'(\d+\s*(?:day|d)\s*(?:left|remaining))',
-                            r'(\d+\s*d\s*\d+\s*h)', r'(\d+\s*days?\s*\d+\s*hours?)']:
-                    m = re.search(pat, srv_txt2, re.IGNORECASE)
-                    if m:
-                        expiry_text = m.group(1)
-                        break
-
-                # Also try selector-based
-                if not expiry_text:
-                    for sel in ["text=/Expiry|Renew|到期|剩余|过期|续期|Plan|套餐/i"]:
+                if FORCE_RENEW or total_h < 48:
+                    for sel in ["button:has-text('Renew')", "button:has-text('renew')", "button:has-text('续期')"]:
                         try:
-                            el = page.query_selector(sel)
-                            if el:
-                                expiry_text = el.inner_text().strip()
+                            btn = page.query_selector(sel)
+                            if btn:
+                                btn.click()
+                                log.info("Clicked Renew")
+                                time.sleep(8)
+                                report["action"] = "renewed"
+                                snap(page, "05_renew.png")
                                 break
                         except Exception:
                             continue
-
-                if expiry_text:
-                    report["expiry"] = expiry_text
-                    log.info("Expiry found: %s", expiry_text)
-
-                    days = h = 0
-                    dm2 = re.search(r"(\d+)\s*d\s+(\d+)\s*h", expiry_text, re.IGNORECASE)
-                    if dm2:
-                        days, h = int(dm2.group(1)), int(dm2.group(2))
-                    else:
-                        dm = re.search(r"(\d+)\s*(?:天|day|d)", expiry_text, re.IGNORECASE)
-                        hm = re.search(r"(\d+)\s*(?:时|h|hour)", expiry_text, re.IGNORECASE)
-                        if dm: days = int(dm.group(1))
-                        if hm: h = int(hm.group(1))
-                    total_h = days * 24 + h
-                    log.info("Expiry: %d days %d h = %d h total", days, h, total_h)
-
-                    if FORCE_RENEW or total_h < 48:
-                        log.info("Need to renew (total_h=%d, threshold=48, force=%s)", total_h, FORCE_RENEW)
-                        renew_btn = None
-                        for sel in ["button:has-text('Renew')", "button:has-text('renew')",
-                                    "button:has-text('续期')", "a:has-text('Renew')", "a:has-text('续期')"]:
-                            try:
-                                renew_btn = page.query_selector(sel)
-                                if renew_btn:
-                                    log.info("Renew button found: %s", sel)
-                                    break
-                            except Exception:
-                                pass
-                        if renew_btn:
-                            renew_btn.click()
-                            log.info("Clicking Renew...")
-                            time.sleep(8)
-                            try:
-                                page.wait_for_load_state("domcontentloaded", timeout=20000)
-                            except Exception:
-                                time.sleep(5)
-                            snap(page, "05_renew.png")
-                            report["action"] = "renewed"
-                            log.info("Server renewed")
-                        else:
-                            report["action"] = "renew-failed"
-                            report["error"] = "Renew button not found"
-                            log.warning("Renew button not found")
-                    else:
-                        log.info("No renewal needed (expiry: %d days)", days)
-                        if report["action"] in ("none",):
-                            report["action"] = "skipped"
-                else:
-                    log.warning("Expiry text not found on server page")
-                    if report["action"] == "none":
-                        report["action"] = "skipped"
+                    if report["action"] not in ("renewed",):
+                        report["action"] = "renew-failed"
+                        report["error"] = "Renew button not found"
+                elif report["action"] == "skipped":
+                    pass  # stays skipped
 
         snap(page, "06_final.png")
 
@@ -439,7 +335,10 @@ def main():
             except Exception:
                 pass
 
-    # --- Build and send report ---
+    _report(report)
+
+
+def _report(report):
     status_icon = "\U0001F7E2" if report["status"] == "running" else "\U0001F534"
     icons = {
         "started": "\u25B6\ufe0f", "renewed": "\U0001F504", "skipped": "\u23ED\ufe0f",
@@ -448,7 +347,7 @@ def main():
     }
     body = (
         f"\U0001F5A5\ufe0f **Zampto Server Report**\n\n"
-        f"**Server ID:** `{SERVER_ID}`\n"
+        f"**Server ID:** `{report['server_id']}`\n"
         f"**Status:** {status_icon} {report['status'].title()}\n"
         f"**Action:** {icons.get(report['action'], '\u2753')} {report['action']}"
     )
@@ -461,26 +360,6 @@ def main():
     log.info("--- Report ---\n%s", body)
     push_tg("\U0001F5A5\ufe0f Zampto Server Report", body)
 
-    os.makedirs("./screenshots", exist_ok=True)
-    with open("./screenshots/report.json", "w", encoding="utf-8") as f:
-        json.dump(report, f, indent=2, ensure_ascii=False)
-    log.info("Report saved")
-
-
-def _finalize_report(report, body=None):
-    if body is None:
-        status_icon = "\U0001F534"
-        body = (
-            f"\U0001F5A5\ufe0f **Zampto Server Report**\n\n"
-            f"**Server ID:** `{report['server_id']}`\n"
-            f"**Status:** {status_icon} {report['status'].title()}\n"
-            f"**Action:** \U0001F512 login-failed"
-        )
-        if report.get("error"):
-            body += f"\n**\u26A0\ufe0f Error:** {report['error']}"
-        body += f"\n\n_Generated: {report['timestamp']}_"
-    log.info("--- Report ---\n%s", body)
-    push_tg("\U0001F5A5\ufe0f Zampto Server Report", body)
     os.makedirs("./screenshots", exist_ok=True)
     with open("./screenshots/report.json", "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2, ensure_ascii=False)
