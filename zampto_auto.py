@@ -49,10 +49,14 @@ def push_tg(title, body):
         log.warning("Telegram config missing, skipping send")
         return
     try:
+        # Pick up proxy from env (same as API session)
+        proxy_url = os.getenv("ALL_PROXY") or os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY")
+        proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
         r = requests.post(
             f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
             json={"chat_id": TG_CHAT_ID, "text": f"{title}\n\n{body}", "parse_mode": "Markdown"},
             timeout=15,
+            proxies=proxies,
         )
         r.raise_for_status()
         log.info("Telegram sent OK")
@@ -120,13 +124,22 @@ def find_csrf_cookie(cookies):
 
 
 def get_api_session():
-    """Create a requests.Session with all necessary headers for Zampto API."""
+    """Create a requests.Session with all necessary headers for Zampto API.
+    Honors ALL_PROXY/HTTPS_PROXY env vars (e.g. socks5h://127.0.0.1:1080)"""
     s = requests.Session()
     s.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept": "application/json, text/javascript, */*; q=0.01",
         "X-Requested-With": "XMLHttpRequest",
     })
+    # Auto-pick up proxy from env (set by workflow when TUIC is active)
+    proxy_url = os.getenv("ALL_PROXY") or os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY")
+    if proxy_url:
+        s.proxies.update({
+            "http": proxy_url,
+            "https": proxy_url,
+        })
+        log.info("API session using proxy: %s", proxy_url)
     return s
 
 

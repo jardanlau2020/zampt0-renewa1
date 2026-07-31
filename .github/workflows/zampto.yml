@@ -51,21 +51,94 @@ jobs:
           pip install -r requirements.txt
           python -c "from cloakbrowser import ensure_binary; ensure_binary()"
 
-      - name: 🌐 启动 Hysteria2 代理（可选）
+      - name: 🌐 启动 TUIC 代理（可选）
         env:
-          HY2_CONFIG: ${{ secrets.HY2_CONFIG }}
+          TUIC_URI: ${{ secrets.TUIC_URI }}
         run: |
-          if [ -z "$HY2_CONFIG" ]; then
-            echo "HY2_CONFIG not set, skipping proxy"
+          set -e
+          if [ -z "$TUIC_URI" ]; then
+            echo "TUIC_URI not set, skipping proxy"
             echo "Direct IP: $(curl -s --max-time 5 ifconfig.me || echo 'fail')"
+            exit 0
+          fi
+
+          echo "[1/4] Parsing TUIC URI ..."
+          # Save URI to file to avoid env quoting issues
+          printf '%s' "$TUIC_URI" > /tmp/tuic_uri.txt
+          # Strip prefix (v2rayntuic:// or tuic://)
+          URI_BODY=$(sed -E 's|^[a-z]+://||' /tmp/tuic_uri.txt)
+          # Split userinfo@host?query
+          USERINFO_HOST=$(echo "$URI_BODY" | cut -d'?' -f1)
+          QUERY=$(echo "$URI_BODY" | cut -d'?' -f2-)
+          USERINFO=$(echo "$USERINFO_HOST" | cut -d'@' -f1)
+          HOSTPORT=$(echo "$USERINFO_HOST" | cut -d'@' -f2-)
+          # URL-decode userinfo (UUID:password might be %-encoded)
+          USERINFO_DECODED=$(printf '%b' "$(echo "$USERINFO" | sed 's/%/\\x/g')")
+          UUID=$(echo "$USERINFO_DECODED" | cut -d':' -f1)
+          PASSWORD=$(echo "$USERINFO_DECODED" | cut -d':' -f2-)
+          SERVER=$(echo "$HOSTPORT" | cut -d':' -f1)
+          PORT=$(echo "$HOSTPORT" | cut -d':' -f2-)
+          # Parse query params
+          SNI=$(echo "$QUERY" | tr '&' '\n' | grep -E '^sni=' | cut -d'=' -f2- | head -1)
+          INSECURE=$(echo "$QUERY" | tr '&' '\n' | grep -E '^insecure=' | cut -d'=' -f2- | head -1)
+          ALPN=$(echo "$QUERY" | tr '&' '\n' | grep -E '^alpn=' | cut -d'=' -f2- | head -1)
+          [ -z "$SNI" ] && SNI="$SERVER"
+          [ -z "$INSECURE" ] && INSECURE=0
+          [ -z "$ALPN" ] && ALPN="h3"
+
+          echo "  Server: $SERVER:$PORT"
+          echo "  UUID:   $UUID"
+          echo "  SNI:    $SNI"
+          echo "  Insecure: $INSECURE"
+          echo "  ALPN:   $ALPN"
+
+          echo "[2/4] Downloading tuic-client ..."
+          # Use EAimTY/tuic (TUIC v5 reference client)
+          curl -sL "https://github.com/EAimTY/tuic/releases/latest/download/tuic-client-x86_64-unknown-linux-gnu" -o /tmp/tuic
+          chmod +x /tmp/tuic
+          /tmp/tuic --version || true
+
+          echo "[3/4] Writing TUIC client config ..."
+          cat > /tmp/tuic_client.json <<EOF
+          {
+            "server": "$SERVER:$PORT",
+            "uuid": "$UUID",
+            "password": "$PASSWORD",
+            "tls": {
+              "server_name": "$SNI",
+              "alpn": ["$ALPN"],
+              "dangerous_accept_invalid_certs": $([ "$INSECURE" = "1" ] && echo true || echo false)
+            },
+            "socks5": {
+              "listen": "127.0.0.1:1080"
+            },
+            "log_level": "info"
+          }
+          EOF
+          cat /tmp/tuic_client.json
+
+          echo "[4/4] Starting tuic-client ..."
+          nohup /tmp/tuic -c /tmp/tuic_client.json > /tmp/tuic.log 2>&1 &
+          TUIC_PID=$!
+          echo "TUIC_PID=$TUIC_PID"
+          sleep 8
+
+          echo "--- TUIC log ---"
+          cat /tmp/tuic.log || true
+          echo "----------------"
+
+          echo "Direct IP: $(curl -s --max-time 5 ifconfig.me || echo 'fail')"
+          echo "Proxy IP:  $(curl -s --max-time 15 --socks5 127.0.0.1:1080 ifconfig.me || echo 'proxy fail')"
+
+          # If proxy works, export env for subsequent step via $GITHUB_ENV
+          if curl -s --max-time 10 --socks5 127.0.0.1:1080 https://www.google.com -o /dev/null; then
+            echo "PROXY_OK=1" >> $GITHUB_ENV
+            echo "ALL_PROXY=socks5h://127.0.0.1:1080" >> $GITHUB_ENV
+            echo "HTTP_PROXY=socks5h://127.0.0.1:1080" >> $GITHUB_ENV
+            echo "HTTPS_PROXY=socks5h://127.0.0.1:1080" >> $GITHUB_ENV
+            echo "[OK] TUIC proxy is ready"
           else
-            curl -sL https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-amd64 -o hysteria
-            chmod +x hysteria
-            echo "$HY2_CONFIG" > config.yaml
-            ./hysteria client -c config.yaml &
-            sleep 5
-            echo "Direct IP: $(curl -s --max-time 5 ifconfig.me || echo 'fail')"
-            echo "Proxy IP: $(curl -s --max-time 10 --socks5 127.0.0.1:1080 ifconfig.me || echo 'proxy fail')"
+            echo "[WARN] TUIC proxy health check failed, will proceed anyway"
           fi
 
       - name: 🔄 运行续期脚本

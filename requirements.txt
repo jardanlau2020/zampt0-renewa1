@@ -1,3 +1,4 @@
 cloakbrowser[geoip]
 playwright
 requests
+PySocks
