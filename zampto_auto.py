@@ -132,14 +132,21 @@ def refresh_csrf_token(api_session, base_url=DASHBOARD_URL, server_id=None):
     Falls back to cookie value if HTML doesn't have the meta tag.
     """
     try:
-        # Try fetching an HTML page that should contain meta csrf-token
-        # /server/{identifier} returns HTML (server management page) - prefer this
+        # Strategy 1: Hit an HTML page - many frameworks put plaintext CSRF in <meta>
+        # Strategy 2: Use cookie value but try different transformations:
+        #   - Full value (e.g. "abc.def")
+        #   - First part only (e.g. "abc")
+        #   - URL-decoded value
+        # Laravel default: cookie is encrypted, plaintext in <meta csrf-token>
+        # Next.js custom: cookie IS the token (no encryption)
+
+        # Try HTML pages first
         html_paths = []
         if server_id:
             html_paths.append(f"/server/{server_id}")
         html_paths.extend([
-            "/dashboard",
             "/servers",
+            "/dashboard",
             "/",  # Root
         ])
 
@@ -152,30 +159,50 @@ def refresh_csrf_token(api_session, base_url=DASHBOARD_URL, server_id=None):
             if r.status_code != 200:
                 continue
 
-            # Look for meta csrf-token (Laravel default pattern)
+            # Look for various CSRF patterns in HTML
             import re
-            m = re.search(r'<meta[^>]+name=["\']csrf-token["\'][^>]+content=["\']([^"\']+)["\']', r.text, re.IGNORECASE)
-            if not m:
-                # Try alternative patterns
-                m = re.search(r'csrf[_-]?token["\']?\s*[:=]\s*["\']([a-zA-Z0-9]{32,})["\']', r.text, re.IGNORECASE)
-            if not m:
-                m = re.search(r'window\._token\s*=\s*["\']([^"\']+)["\']', r.text, re.IGNORECASE)
-            if not m:
-                # Pterodactyl-style: window.Pterodactyl.token
-                m = re.search(r'Pterodactyl\.token\s*=\s*["\']([^"\']+)["\']', r.text, re.IGNORECASE)
+            patterns = [
+                r'<meta[^>]+name=["\']csrf-token["\'][^>]+content=["\']([^"\']+)["\']',
+                r'<meta[^>]+name=["\']_token["\'][^>]+content=["\']([^"\']+)["\']',
+                r'csrf[_-]?token["\']?\s*[:=]\s*["\']([a-zA-Z0-9]{32,})["\']',
+                r'window\._token\s*=\s*["\']([^"\']+)["\']',
+                r'Pterodactyl\.token\s*=\s*["\']([^"\']+)["\']',
+                r'"X-CSRF-TOKEN"[:\s]*"([^"]+)"',
+                r'"csrfToken"[:\s]*"([^"]+)"',
+                # Look in Next.js __NEXT_DATA__
+                r'__NEXT_DATA__"[^>]*>([^<]+)</script>',
+            ]
+            for pat in patterns:
+                m = re.search(pat, r.text, re.IGNORECASE)
+                if m:
+                    token = m.group(1)
+                    # If it's __NEXT_DATA__ JSON, search inside it for token
+                    if "NEXT_DATA" in pat:
+                        inner_match = re.search(r'"(?:csrf|token|xsrf)[^"]*"\s*:\s*"([^"]{16,})"', token, re.IGNORECASE)
+                        if inner_match:
+                            token = inner_match.group(1)
+                        else:
+                            continue
+                    log.info("  ✓ Found CSRF token in HTML (pattern: %s, length=%d)", pat[:40], len(token))
+                    return token
 
-            if m:
-                token = m.group(1)
-                log.info("  ✓ Found CSRF token in HTML (length=%d)", len(token))
-                return token
+            log.warning("  No meta csrf-token found in HTML (size=%d)", len(r.text))
 
-            log.warning("  No meta csrf-token found in HTML")
-
-        # Fallback: use cookie value (won't work for Laravel but better than nothing)
+        # Fallback: try cookie value transformations
         for c in api_session.cookies:
             if "csrf" in c.name.lower():
-                log.warning("Falling back to CSRF cookie value (length=%d)", len(c.value))
-                return c.value
+                cookie_val = c.value
+                log.info("Cookie CSRF value: %s (length=%d)", cookie_val[:50] + "...", len(cookie_val))
+
+                # Try first part only (split by '.') - common HMAC pattern
+                if "." in cookie_val:
+                    parts = cookie_val.split(".")
+                    log.info("Trying cookie first-part only: %s... (length=%d)", parts[0][:30], len(parts[0]))
+                    return parts[0]  # Most likely to work for HMAC-style tokens
+
+                # Otherwise return raw cookie value
+                log.info("Returning raw cookie value as CSRF token")
+                return cookie_val
 
         log.warning("No CSRF token found anywhere")
         return None
@@ -412,18 +439,49 @@ def phase_api_renewal(use_cookies=None):
         log.info("Using endpoint: %s", used_path)
         log.info("Server data received (truncated): %s", json.dumps(server_data, indent=2, ensure_ascii=False)[:800])
 
-        # Parse status - data may be a list (from list endpoint) or single object
-        state_info = server_data.get("data", {}) if isinstance(server_data, dict) else {}
-        if isinstance(state_info, list):
-            # List endpoint - find our server
-            log.info("Got list of %d servers, looking for ID=%s", len(state_info), SERVER_ID)
-            state_info = next((s for s in state_info if str(s.get("id")) == str(SERVER_ID)), state_info[0] if state_info else {})
+        # Parse status - response shape can be:
+        #   {"servers": [...]} - Zampto list endpoint
+        #   {"data": {...}} or {"data": [...]} - Pterodactyl/other
+        #   {...} - direct server object
+        if isinstance(server_data, dict):
+            if "servers" in server_data:
+                # Zampto list endpoint - find our server by ID
+                servers_list = server_data["servers"]
+                log.info("Got %d servers, looking for ID=%s", len(servers_list), SERVER_ID)
+                state_info = next(
+                    (s for s in servers_list if str(s.get("id")) == str(SERVER_ID)),
+                    servers_list[0] if servers_list else {}
+                )
+            elif "data" in server_data:
+                state_info = server_data["data"]
+                if isinstance(state_info, list):
+                    state_info = next(
+                        (s for s in state_info if str(s.get("id")) == str(SERVER_ID)),
+                        state_info[0] if state_info else {}
+                    )
+            else:
+                # Direct server object
+                state_info = server_data
+        else:
+            state_info = {}
 
-        status_state = state_info.get("status", {}).get("state", "").lower() if isinstance(state_info, dict) else ""
-        if not status_state and isinstance(state_info, dict):
-            # Try alternative status field formats
-            status_state = str(state_info.get("state", state_info.get("status", ""))).lower()
+        if not isinstance(state_info, dict):
+            state_info = {}
+
+        # Extract identifier (8-char short UUID, e.g. 'f8a96d6e')
+        server_identifier = state_info.get("identifier")
+        log.info("Server identifier: %s", server_identifier)
+
+        # Status - Zampto uses 'status' field directly with value 'active'/'offline'
+        status_state = ""
+        raw_status = state_info.get("status", "")
+        if isinstance(raw_status, dict):
+            status_state = raw_status.get("state", "").lower()
+        elif raw_status:
+            status_state = str(raw_status).lower()
+        # Zampto: 'active' means running, 'offline'/'suspended' means stopped
         is_running = status_state in ["running", "started", "active", "online"]
+        log.info("Raw status field: %r -> state=%s -> is_running=%s", raw_status, status_state, is_running)
 
         report.update({
             "status": "running" if is_running else "stopped",
@@ -433,10 +491,6 @@ def phase_api_renewal(use_cookies=None):
             "timestamp": datetime.now(timezone.utc).isoformat(),
         })
         log.info("Server status: %s", report["status"])
-
-        # Extract identifier (short UUID) for use in Pterodactyl-style API paths
-        server_identifier = state_info.get("identifier") if isinstance(state_info, dict) else None
-        log.info("Server identifier: %s", server_identifier)
 
         # Start if stopped
         started = False
