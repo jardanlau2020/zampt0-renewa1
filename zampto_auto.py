@@ -123,20 +123,61 @@ def find_csrf_cookie(cookies):
     return None
 
 
-def refresh_csrf_token(api_session, base_url=DASHBOARD_URL):
-    """Fetch a fresh CSRF token by hitting any GET endpoint.
-    The server issues a new zampto_csrf cookie via Set-Cookie on each request.
-    Returns the latest CSRF token from the session cookies."""
+def refresh_csrf_token(api_session, base_url=DASHBOARD_URL, server_id=None):
+    """Fetch a fresh CSRF token by hitting an HTML page.
+    Laravel-style: server sets encrypted token in cookie, plaintext in <meta>.
+    We need the PLAINTEXT token from HTML to send via X-XSRF-TOKEN header.
+
+    Strategy: GET /server/{identifier} (HTML page) and extract meta csrf-token.
+    Falls back to cookie value if HTML doesn't have the meta tag.
+    """
     try:
-        # Hit a lightweight endpoint - the API itself returns Set-Cookie with new CSRF
-        r = api_session.get(f"{base_url}/api/servers", timeout=10)
-        # The Set-Cookie response header auto-updates api_session.cookies
-        # Find the latest csrf cookie value
+        # Try fetching an HTML page that should contain meta csrf-token
+        # /server/{identifier} returns HTML (server management page) - prefer this
+        html_paths = []
+        if server_id:
+            html_paths.append(f"/server/{server_id}")
+        html_paths.extend([
+            "/dashboard",
+            "/servers",
+            "/",  # Root
+        ])
+
+        for path in html_paths:
+            url = f"{base_url}{path}"
+            log.info("Fetching HTML for CSRF: %s", path)
+            r = api_session.get(url, timeout=15, allow_redirects=False)
+            log.info("  HTML %d, len=%d, redirect=%s", r.status_code, len(r.text), r.headers.get("Location", "none"))
+
+            if r.status_code != 200:
+                continue
+
+            # Look for meta csrf-token (Laravel default pattern)
+            import re
+            m = re.search(r'<meta[^>]+name=["\']csrf-token["\'][^>]+content=["\']([^"\']+)["\']', r.text, re.IGNORECASE)
+            if not m:
+                # Try alternative patterns
+                m = re.search(r'csrf[_-]?token["\']?\s*[:=]\s*["\']([a-zA-Z0-9]{32,})["\']', r.text, re.IGNORECASE)
+            if not m:
+                m = re.search(r'window\._token\s*=\s*["\']([^"\']+)["\']', r.text, re.IGNORECASE)
+            if not m:
+                # Pterodactyl-style: window.Pterodactyl.token
+                m = re.search(r'Pterodactyl\.token\s*=\s*["\']([^"\']+)["\']', r.text, re.IGNORECASE)
+
+            if m:
+                token = m.group(1)
+                log.info("  ✓ Found CSRF token in HTML (length=%d)", len(token))
+                return token
+
+            log.warning("  No meta csrf-token found in HTML")
+
+        # Fallback: use cookie value (won't work for Laravel but better than nothing)
         for c in api_session.cookies:
             if "csrf" in c.name.lower():
-                log.info("Refreshed CSRF token from server (length=%d)", len(c.value))
+                log.warning("Falling back to CSRF cookie value (length=%d)", len(c.value))
                 return c.value
-        log.warning("No CSRF cookie in session after refresh")
+
+        log.warning("No CSRF token found anywhere")
         return None
     except Exception as e:
         log.warning("CSRF refresh failed: %s", e)
@@ -393,13 +434,16 @@ def phase_api_renewal(use_cookies=None):
         })
         log.info("Server status: %s", report["status"])
 
+        # Extract identifier (short UUID) for use in Pterodactyl-style API paths
+        server_identifier = state_info.get("identifier") if isinstance(state_info, dict) else None
+        log.info("Server identifier: %s", server_identifier)
+
         # Start if stopped
         started = False
         if not is_running:
             log.info("Server is stopped, attempting to start...")
-            # Refresh CSRF token immediately before POST - Laravel-style panels
-            # issue a new CSRF cookie on every request and require matching header
-            fresh_csrf = refresh_csrf_token(api_session)
+            # Refresh CSRF token from HTML page (Laravel puts plaintext in <meta>)
+            fresh_csrf = refresh_csrf_token(api_session, server_id=server_identifier)
             if fresh_csrf:
                 api_session.headers.update({
                     "X-CSRF-Token": fresh_csrf,
@@ -408,19 +452,26 @@ def phase_api_renewal(use_cookies=None):
                 })
                 log.info("Using fresh CSRF token for POST (length=%d)", len(fresh_csrf))
 
-            # The server has 'panel_id' field which suggests Pterodactyl-style API
-            # Try /api/servers/{id}/start first since we got list from /api/servers
-            start_paths = [
+            # Try both Pterodactyl-style and custom paths
+            # Pterodactyl client API uses: /api/client/servers/{identifier}/power with body {signal: start}
+            start_paths = []
+            if server_identifier:
+                start_paths.extend([
+                    f"/api/client/servers/{server_identifier}/power",
+                ])
+            start_paths.extend([
                 f"/api/servers/{SERVER_ID}/start",
                 f"/api/servers/start",
                 f"/api/server/{SERVER_ID}/start",
                 f"/api/server/{SERVER_ID}/power",
                 f"/api/servers/{SERVER_ID}/power",
-            ]
+            ])
             for start_path in start_paths:
                 start_url = f"{DASHBOARD_URL}{start_path}"
                 log.info("  Trying start endpoint: %s", start_path)
-                resp = api_session.post(start_url, timeout=15)
+                # Pterodactyl expects JSON body {signal: 'start'}
+                post_body = {"signal": "start"} if "/client/servers/" in start_path else {}
+                resp = api_session.post(start_url, json=post_body, timeout=15)
                 if resp.status_code in [200, 201, 204, 202]:
                     report["action"] = "started"
                     log.info("  ✓ Server start initiated (status %d)", resp.status_code)
@@ -433,7 +484,7 @@ def phase_api_renewal(use_cookies=None):
                     # If CSRF error, refresh and retry this path
                     if "CSRF" in resp.text or "csrf" in resp.text.lower():
                         log.info("  CSRF error detected, refreshing token...")
-                        fresh_csrf = refresh_csrf_token(api_session)
+                        fresh_csrf = refresh_csrf_token(api_session, server_id=server_identifier)
                         if fresh_csrf:
                             api_session.headers.update({
                                 "X-CSRF-Token": fresh_csrf,
@@ -478,8 +529,8 @@ def phase_api_renewal(use_cookies=None):
                 should_renew = FORCE_RENEW or total_h < 48
                 if should_renew:
                     log.info("Renewing server (%d h left, threshold: 48h)", total_h)
-                    # Refresh CSRF before renew POST
-                    fresh_csrf = refresh_csrf_token(api_session)
+                    # Refresh CSRF before renew POST - use HTML extraction
+                    fresh_csrf = refresh_csrf_token(api_session, server_id=server_identifier)
                     if fresh_csrf:
                         api_session.headers.update({
                             "X-CSRF-Token": fresh_csrf,
@@ -487,16 +538,20 @@ def phase_api_renewal(use_cookies=None):
                             "X-Csrf-Token": fresh_csrf,
                         })
                     renewed = False
-                    renew_paths = [
+                    renew_paths = []
+                    if server_identifier:
+                        renew_paths.append(f"/api/client/servers/{server_identifier}/renew")
+                    renew_paths.extend([
                         f"/api/servers/{SERVER_ID}/renew",
                         f"/api/server/{SERVER_ID}/renew",
                         f"{used_path}/renew",
                         f"/api/servers/renew",
-                    ]
+                        f"/api/renew",
+                    ])
                     for renew_path in renew_paths:
                         renew_url = f"{DASHBOARD_URL}{renew_path}"
                         log.info("  Trying renew endpoint: %s", renew_path)
-                        resp = api_session.post(renew_url, timeout=15)
+                        resp = api_session.post(renew_url, json={}, timeout=15)
                         if resp.status_code in [200, 201, 204, 202]:
                             report["action"] = "renewed"
                             log.info("  ✓ Renewal successful (status %d)", resp.status_code)
@@ -506,7 +561,7 @@ def phase_api_renewal(use_cookies=None):
                             log.warning("  Renew failed at %s: %d %s", renew_path, resp.status_code, resp.text[:200])
                             # Refresh CSRF if needed
                             if "CSRF" in resp.text or "csrf" in resp.text.lower():
-                                fresh_csrf = refresh_csrf_token(api_session)
+                                fresh_csrf = refresh_csrf_token(api_session, server_id=server_identifier)
                                 if fresh_csrf:
                                     api_session.headers.update({
                                         "X-CSRF-Token": fresh_csrf,
