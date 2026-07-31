@@ -483,8 +483,10 @@ def phase_api_renewal(use_cookies=None):
             if not started:
                 report["error"] = "Start failed on all probed endpoints"
 
-        # Check expiry and renew
-        if report["action"] in ("started", "skipped"):
+        # Check expiry and renew - always run this check (even if server was already running)
+        # Action "none" means no action taken yet, "started" means just started.
+        # Either way, we need to check if renewal is required.
+        if report["action"] in ("started", "skipped", "none"):
             expiry_val = state_info.get("expiry") or state_info.get("renewal") if isinstance(state_info, dict) else None
             if expiry_val:
                 report["expiry"] = str(expiry_val)
