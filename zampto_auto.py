@@ -178,8 +178,35 @@ def main():
         # ── 6. Start server if stopped ──────────────────────────────────
         if not is_running:
             log.info("Server is stopped — clicking Start")
-            start_btn = page.query_selector(
-                "button:has-text('Start'), button:has-text('start'), .btn-start")
+            log.info("[DEBUG] Page visible text (first 500 chars):")
+            page_text = page.inner_text("body")
+            log.info(page_text[:500])
+
+            start_selectors = [
+                "button:has-text('Start')",
+                "button:has-text('start')",
+                "a:has-text('Start')",
+                "div:has-text('Start')",
+                ".btn-start",
+                "button:has-text('启动')",
+                "a:has-text('启动')",
+                "button:has-text('重启')",
+                "a:has-text('重启')",
+                "button:has-text('开始')",
+                "a:has-text('开始')",
+                "text=Start",
+                "text=启动",
+            ]
+            start_btn = None
+            for sel in start_selectors:
+                try:
+                    start_btn = page.query_selector(sel)
+                    if start_btn:
+                        log.info("Found Start button with selector: %s", sel)
+                        break
+                except Exception:
+                    continue
+
             if start_btn:
                 start_btn.click()
                 time.sleep(3)
@@ -188,10 +215,33 @@ def main():
                 report["action"] = "started"
                 log.info("Server start clicked")
             else:
-                log.warning("Start button not found")
+                log.warning("Start button not found with any known selector")
+                report["action"] = "start-failed"
+                report["error"] = "Start button not found — check screenshots for page structure"
 
         # ── 7. Check expiry & handle renewal ────────────────────────────
-        expiry_el = page.query_selector("text=/Expiry|Renew|到期|剩余/i")
+        expiry_selectors = [
+            "text=/Expiry|Renew|到期|剩余/i",
+            "text=/Expire|过期|有效期/i",
+            "text=/Plan|套餐|版本/i",
+            "text=/Expiring|即将到期/i",
+            "text=/days|h/m/i",
+            "text=/Remaining|余额/i",
+            "div:has-text('到期')",
+            "div:has-text('Expiry')",
+            "span:has-text('到期')",
+            "span:has-text('Expiry')",
+        ]
+        expiry_el = None
+        for sel in expiry_selectors:
+            try:
+                expiry_el = page.query_selector(sel)
+                if expiry_el:
+                    log.info("Found expiry element with selector: %s", sel)
+                    break
+            except Exception:
+                continue
+
         if expiry_el:
             expiry_text = expiry_el.inner_text()
             report["expiry"] = expiry_text
@@ -204,9 +254,30 @@ def main():
                          days, hours, FORCE_RENEW)
                 report["action"] = "renewed"
 
-                renew_btn = page.query_selector(
-                    "button:has-text('Renew'), button:has-text('Renewal'), "
-                    "button:has-text('续期'), .renew-btn, .btn-renew")
+                renew_selectors = [
+                    "button:has-text('Renew')",
+                    "button:has-text('Renewal')",
+                    "button:has-text('续期')",
+                    "button:has-text('续费')",
+                    "a:has-text('Renew')",
+                    "a:has-text('续期')",
+                    "a:has-text('续费')",
+                    ".renew-btn",
+                    ".btn-renew",
+                    "text=Renew",
+                    "text=续期",
+                    "text=续费",
+                ]
+                renew_btn = None
+                for sel in renew_selectors:
+                    try:
+                        renew_btn = page.query_selector(sel)
+                        if renew_btn:
+                            log.info("Found renew button with selector: %s", sel)
+                            break
+                    except Exception:
+                        continue
+
                 if renew_btn:
                     renew_btn.click()
                     time.sleep(2)
@@ -230,15 +301,18 @@ def main():
                         log.info("New expiry: %s", new_expiry)
                         report["expiry"] = new_expiry
                 else:
-                    log.warning("Renew button not found")
+                    log.warning("Renew button not found with any known selector")
                     report["action"] = "renew-failed"
                     report["error"] = "Renew button not found on page"
             else:
                 log.info("No renewal needed (total_hours=%d)", total_h)
                 report["action"] = "skipped"
         else:
-            log.warning("Expiry element not found")
-            report["error"] = "Expiry element not found"
+            log.warning("Expiry element not found with any known selector")
+            log.info("[DEBUG] Full page text (first 800 chars) for expiry search:")
+            page_text = page.inner_text("body")
+            log.info(page_text[:800])
+            report["error"] = "Expiry element not found — check screenshots for page structure"
 
         screenshot(page, "07_final.png")
 
