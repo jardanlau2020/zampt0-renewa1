@@ -1,6 +1,6 @@
 # Zampto 自动续期 ⚡
 
-通过 GitHub Actions 每日自动检查并续期你的 Zampto Minecraft 服务器。
+通过 GitHub Actions 每日自动检查并续期你的 Zampto Minecraft 服务器。https://zampto.net/
 
 **功能特性：**
 - 每日 UTC 00:00（北京时间 08:00）自动检查
