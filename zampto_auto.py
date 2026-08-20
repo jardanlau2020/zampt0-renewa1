@@ -896,18 +896,23 @@ def main():
     if success:
         log.info("✓ Renewal completed successfully!")
 
-        # 查询最新到期时间
+        # 查询最新到期时间（显示剩余时间）
         expiry_str = ""
         try:
             api = get_api_session()
             sync_cookies_to_session(api, cookies)
             r = api.get(f"{DASHBOARD_URL}/api/servers", timeout=10)
+            log.info("  查询到期: status=%d", r.status_code)
             if r.status_code == 200:
                 data = r.json()
+                log.info("  /api/servers 返回 keys: %s", list(data.keys()))
                 servers = data.get("servers", [])
+                log.info("  发现 %d 个服务器", len(servers))
                 for sv in servers:
+                    log.info("    检查服务器 id=%s (期望=%s)", sv.get("id"), SERVER_ID)
                     if str(sv.get("id")) == str(SERVER_ID):
                         exp = sv.get("renewal", "")
+                        log.info("    匹配成功! renewal=%s", exp)
                         if exp:
                             from datetime import datetime as dt_cls
                             try:
@@ -926,11 +931,16 @@ def main():
                                     if h > 0: parts.append(f"{h}h")
                                     parts.append(f"{m}min")
                                     expiry_str = " ".join(parts)
-                            except Exception:
-                                expiry_str = str(exp)
+                                    log.info("  到期剩余: %s", expiry_str)
+                            except Exception as e:
+                                log.warning("  解析到期时间失败: %s", e)
                         break
-        except:
-            pass
+                else:
+                    log.warning("  未在返回中找到服务器 %s", SERVER_ID)
+            else:
+                log.warning("  API 请求失败: %s", r.text[:200])
+        except Exception as e:
+            log.warning("  查询到期时间异常: %s", e)
 
         push_tg("🖥️ Zampto 服务器报告", 
             f"**服务器 ID:** `{SERVER_ID}`\n"
