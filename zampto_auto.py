@@ -911,73 +911,60 @@ def main():
 
     # 浏览器自动续期 (带 CSRF 支持)
     log.info("Starting browser-based server check & renewal...")
-    success = phase_browser_renewal(cookies=cookies)
+    status = phase_browser_renewal(cookies=cookies)
 
-    if success:
-        log.info("✓ Renewal completed successfully!")
+    # 查询最新到期时间
+    expiry_str = ""
+    try:
+        api = get_api_session()
+        sync_cookies_to_session(api, cookies)
+        r = api.get(f"{DASHBOARD_URL}/api/servers", timeout=10)
+        if r.status_code == 200:
+            for sv in (r.json().get("servers") or []):
+                if str(sv.get("id")) == str(SERVER_ID):
+                    exp_raw = sv.get("renewal", "")
+                    if exp_raw:
+                        from datetime import datetime as dt_cls, timedelta
+                        try:
+                            dt_ob = dt_cls.fromisoformat(exp_raw.replace("Z", "+00:00"))
+                            expires_at = dt_ob + timedelta(hours=48)
+                            now = datetime.now(timezone.utc)
+                            if expires_at.tzinfo is None:
+                                expires_at = expires_at.replace(tzinfo=timezone.utc)
+                            total_s = int((expires_at - now).total_seconds())
+                            if total_s > 0:
+                                d = total_s // 86400
+                                h = (total_s % 86400) // 3600
+                                m = (total_s % 3600) // 60
+                                parts = []
+                                if d > 0: parts.append(f"{d}d")
+                                if h > 0: parts.append(f"{h}h")
+                                parts.append(f"{m}min")
+                                expiry_str = " ".join(parts)
+                        except:
+                            pass
+                    break
+    except:
+        pass
 
-        # 查询最新到期时间（显示剩余时间）
-        expiry_str = ""
-        try:
-            api = get_api_session()
-            sync_cookies_to_session(api, cookies)
-            r = api.get(f"{DASHBOARD_URL}/api/servers", timeout=10)
-            log.info("  查询到期: status=%d", r.status_code)
-            if r.status_code == 200:
-                data = r.json()
-                log.info("  /api/servers 返回 keys: %s", list(data.keys()))
-                servers = data.get("servers", [])
-                log.info("  发现 %d 个服务器", len(servers))
-                for sv in servers:
-                    log.info("    检查服务器 id=%s (期望=%s)", sv.get("id"), SERVER_ID)
-                    if str(sv.get("id")) == str(SERVER_ID):
-                        exp_raw = sv.get("renewal", "")
-                        log.info("    匹配成功! renewal (原值)=%s", exp_raw)
-                        if exp_raw:
-                            from datetime import datetime as dt_cls, timedelta
-                            try:
-                                dt_ob = dt_cls.fromisoformat(exp_raw.replace("Z", "+00:00"))
-                                # renewal 是上次续期时间, 到期 = renewal + 48h
-                                expires_at = dt_ob + timedelta(hours=48)
-                                now = datetime.now(timezone.utc)
-                                if expires_at.tzinfo is None:
-                                    expires_at = expires_at.replace(tzinfo=timezone.utc)
-                                delta = expires_at - now
-                                total_s = int(delta.total_seconds())
-                                if total_s > 0:
-                                    d = total_s // 86400
-                                    h = (total_s % 86400) // 3600
-                                    m = (total_s % 3600) // 60
-                                    parts = []
-                                    if d > 0: parts.append(f"{d}d")
-                                    if h > 0: parts.append(f"{h}h")
-                                    parts.append(f"{m}min")
-                                    expiry_str = " ".join(parts)
-                                    log.info("  到期剩余: %s", expiry_str)
-                                else:
-                                    log.warning("  到期时间已过或解析异常s")
-                            except Exception as e:
-                                log.warning("  解析到期时间失败: %s", e)
-                        else:
-                            log.warning("  renewal 字段为空")
-                        break
-                else:
-                    log.warning("  未在返回中找到服务器 %s", SERVER_ID)
-            else:
-                log.warning("  API 请求失败: %s", r.text[:200])
-        except Exception as e:
-            log.warning("  查询到期时间异常: %s", e)
-
-        push_tg("🖥️ Zampto 服务器报告", 
+    if status == "renewed":
+        log.info("✓ 续期成功")
+        push_tg("🖥️ Zampto 服务器报告",
             f"**服务器 ID:** `{SERVER_ID}`\n"
             f"**状态:** 🟢 运行中\n"
             f"**操作:** 🔄 已续期"
             + (f"\n**到期:** {expiry_str}" if expiry_str else "") + "\n"
             f"\n*浏览器自动续期完成*")
-        if not is_github_actions:
-            log.info("Tip: Run without interactive mode to save session for future runs")
+    elif status == "skipped":
+        log.info("⏭️ 剩余时间充足, 跳过续期")
+        push_tg("🖥️ Zampto 服务器报告",
+            f"**服务器 ID:** `{SERVER_ID}`\n"
+            f"**状态:** 🟢 运行中\n"
+            f"**操作:** ⏭️ 已跳过"
+            + (f"\n**到期:** {expiry_str}" if expiry_str else "") + "\n"
+            f"\n*剩余时间充足, 无需续期*")
     else:
-        log.error("✗ Renewal failed")
+        log.error("✗ 续期失败")
         push_tg("🖥️ Zampto 服务器报告",
             f"**服务器 ID:** `{SERVER_ID}`\n"
             f"**状态:** 🔴 失败\n"
