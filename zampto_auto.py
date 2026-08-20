@@ -149,52 +149,68 @@ def find_csrf_cookie(cookies):
 
 
 def refresh_csrf_token(api_session, base_url=DASHBOARD_URL, server_id=None):
-    """Get the latest CSRF token from server response.
+    """Get a fresh CSRF token from server response.
 
-    Per the Zampto dashboard JS (getCsrfCookie / getCsrfToken in HTML):
-      - Token = full zampto_csrf cookie value
-      - Sent via X-CSRF-Token header on every non-GET request
-      - Server issues a NEW cookie on every response (old value expires immediately)
-
-    IMPORTANT: We read Set-Cookie header DIRECTLY from response.raw.headers.getlist,
-    because requests.Session's cookie jar sometimes keeps stale value if domain/path
-    don't exactly match. Multiple Set-Cookie headers may be merged into one dict entry.
+    Zampto 已不再在 Set-Cookie header 中返回 zampto_csrf。
+    本函数依次尝试:
+      1. Set-Cookie header (旧方法)
+      2. HTML body 解析 (<meta> / JS 变量)
+      3. session.cookies (旧 token, 可能已过期)
     """
+    def extract_csrf(text):
+        """从 HTML 中提取 CSRF token"""
+        # <meta name="csrf-token" content="...">
+        m = re.search(r'<meta\s+[^>]*name=[\'"]csrf-token[\'"]\s+content=[\'"]([^\'"]+)[\'"]', text, re.I)
+        if m:
+            return m.group(1)
+        # var csrfToken = '...' 或 window.csrf = '...'
+        m = re.search(r"(?:csrf|crsf|_token)\s*[:=]\s*[\"']([A-Za-z0-9_\-\.]{40,300})", text, re.I)
+        if m:
+            return m.group(1)
+        return None
+
     try:
-        # 先访主页面 (HTML), Laravel web middleware 在 HTML 才设置 CSRF cookie
         for url in [f"{base_url}/", f"{base_url}/dashboard", f"{base_url}/api/servers"]:
             r = api_session.get(url, timeout=10)
             log.info("  CSRF refresh via %s (status=%d)", url, r.status_code)
+            ct = (r.headers.get("content-type") or "").lower()
 
-            # Read Set-Cookie headers DIRECTLY from raw response
+            # Method 1: from Set-Cookie header
+            set_cookies = []
             try:
                 set_cookies = r.raw.headers.getlist("Set-Cookie")
             except (AttributeError, KeyError):
-                set_cookies = []
                 if "Set-Cookie" in r.headers:
                     set_cookies.append(r.headers["Set-Cookie"])
-
             for sc in set_cookies:
                 lower_sc = sc.lower()
                 if "zampto_csrf=" in lower_sc:
-                    idx = lower_sc.index("zampto_csrf=") + len("zampto_csrf=")
-                    rest = sc[idx:]
+                    start = lower_sc.index("zampto_csrf=") + len("zampto_csrf=")
+                    rest = sc[start:]
                     end = rest.find(";")
-                    token = rest if end == -1 else rest[:end]
+                    token = rest[:end] if end != -1 else rest
                     token = token.strip()
                     if token:
-                        log.info("  ✓ Fresh CSRF from Set-Cookie (length=%d)", len(token))
+                        log.info("  ✓ CSRF from Set-Cookie (len=%d)", len(token))
                         api_session.cookies.set("zampto_csrf", token, domain=".zampto.net", path="/")
                         return token
 
-        # Fallback: read from session.cookies
-        log.warning("  No Set-Cookie with zampto_csrf in response, using session.cookies")
+            # Method 2: from HTML document
+            if "html" in ct:
+                token = extract_csrf(r.text)
+                if token:
+                    log.info("  ✓ CSRF from HTML body (len=%d)", len(token))
+                    api_session.cookies.set("zampto_csrf", token, domain=".zampto.net", path="/")
+                    return token
+
+        # Fallback: stale token from session.cookies
+        log.warning("  No fresh CSRF from Set-Cookie or HTML, using session.cookies")
         for c in api_session.cookies:
             if "csrf" in c.name.lower():
-                log.info("  ✓ CSRF from session.cookies (length=%d)", len(c.value))
+                log.info("  Using stale CSRF from cookies (len=%d)", len(c.value))
                 return c.value
 
-        log.warning("  No CSRF cookie found anywhere")
+        log.warning("  No CSRF found anywhere")
         return None
     except Exception as e:
         log.warning("  CSRF refresh failed: %s", e)
