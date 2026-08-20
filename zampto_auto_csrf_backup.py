@@ -161,31 +161,33 @@ def refresh_csrf_token(api_session, base_url=DASHBOARD_URL, server_id=None):
     don't exactly match. Multiple Set-Cookie headers may be merged into one dict entry.
     """
     try:
-        # 先访主页面 (HTML), Laravel web middleware 在 HTML 才设置 CSRF cookie
-        for url in [f"{base_url}/", f"{base_url}/dashboard", f"{base_url}/api/servers"]:
-            r = api_session.get(url, timeout=10)
-            log.info("  CSRF refresh via %s (status=%d)", url, r.status_code)
+        # Trigger a fresh Set-Cookie by hitting any endpoint
+        r = api_session.get(f"{base_url}/api/servers", timeout=10)
+        log.info("  Triggered CSRF refresh via /api/servers (status=%d)", r.status_code)
 
-            # Read Set-Cookie headers DIRECTLY from raw response
-            try:
-                set_cookies = r.raw.headers.getlist("Set-Cookie")
-            except (AttributeError, KeyError):
-                set_cookies = []
-                if "Set-Cookie" in r.headers:
-                    set_cookies.append(r.headers["Set-Cookie"])
+        # Read Set-Cookie headers DIRECTLY from raw response (most reliable)
+        try:
+            set_cookies = r.raw.headers.getlist("Set-Cookie")
+        except (AttributeError, KeyError):
+            set_cookies = []
+            # Fallback to single header
+            if "Set-Cookie" in r.headers:
+                set_cookies.append(r.headers["Set-Cookie"])
 
-            for sc in set_cookies:
-                lower_sc = sc.lower()
-                if "zampto_csrf=" in lower_sc:
-                    idx = lower_sc.index("zampto_csrf=") + len("zampto_csrf=")
-                    rest = sc[idx:]
-                    end = rest.find(";")
-                    token = rest if end == -1 else rest[:end]
-                    token = token.strip()
-                    if token:
-                        log.info("  ✓ Fresh CSRF from Set-Cookie (length=%d)", len(token))
-                        api_session.cookies.set("zampto_csrf", token, domain=".zampto.net", path="/")
-                        return token
+        for sc in set_cookies:
+            lower_sc = sc.lower()
+            if "zampto_csrf=" in lower_sc:
+                # Extract value between "zampto_csrf=" and first ";"
+                idx = lower_sc.index("zampto_csrf=") + len("zampto_csrf=")
+                rest = sc[idx:]
+                end = rest.find(";")
+                token = rest if end == -1 else rest[:end]
+                token = token.strip()
+                if token:
+                    log.info("  ✓ Fresh CSRF from Set-Cookie header (length=%d)", len(token))
+                    # Also update session.cookies so subsequent requests send the right cookie
+                    api_session.cookies.set("zampto_csrf", token, domain=".zampto.net", path="/")
+                    return token
 
         # Fallback: read from session.cookies
         log.warning("  No Set-Cookie with zampto_csrf in response, using session.cookies")
