@@ -895,10 +895,19 @@ def main():
 
     if success:
         log.info("✓ Renewal completed successfully!")
+        push_tg("🖥️ Zampto 服务器报告", 
+            f"**服务器 ID:** `{SERVER_ID}`\n"
+            f"**状态:** 🟢 运行中\n"
+            f"**操作:** 🔄 已续期\n\n"
+            f"*浏览器自动续期完成*")
         if not is_github_actions:
             log.info("Tip: Run without interactive mode to save session for future runs")
     else:
         log.error("✗ Renewal failed")
+        push_tg("🖥️ Zampto 服务器报告",
+            f"**服务器 ID:** `{SERVER_ID}`\n"
+            f"**状态:** 🔴 失败\n"
+            f"**错误:** 浏览器续期异常")
         sys.exit(1)
 
 
