@@ -406,6 +406,14 @@ def phase_browser_renewal(cookies=None):
 
         log.info("面板加载完成, URL: %s", page.url)
 
+        # 转到服务器详情页（续期按钮在这里）
+        server_url = f"{DASHBOARD_URL}/server?id={SERVER_ID}"
+        log.info("导航到服务器页: %s", server_url)
+        page.goto(server_url, wait_until="load", timeout=30000)
+        page.wait_for_timeout(3000)
+        snap(page, "03_server_page.png")
+        log.info("服务器页加载完成, URL: %s", page.url)
+
         # 执行续期
         sid = SERVER_ID
         renewed, data = renew_via_browser_fetch(page, sid)
