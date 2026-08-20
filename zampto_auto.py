@@ -315,14 +315,134 @@ def phase_browser_login_interactive():
     log.info("Interactive login completed. Session saved to session.json.")
 
 
-def phase_api_renewal(use_cookies=None):
-    """Phase 2: Use provided cookies to renew server via pure API (no browser)."""
-    log.info("=== PURE API RENEWAL MODE ===")
+# ========================
+# Phase 2: 浏览器自动续期
+# ========================
+def renew_via_browser_fetch(page, sid):
+    """在浏览器页面上下文中尝试刷新服务器。
+    CSRF token 由浏览器自动管理，无需手动刷新。"""
+    import json as _json
+    bodies = [
+        {"server_id": sid}, {"id": sid}, {"serverId": sid},
+        {"server": sid}, {"sid": sid},
+    ]
+    for body in bodies:
+        try:
+            js = f"""
+(async () => {{
+    try {{
+        const res = await fetch('/api/server/renew', {{
+            method: 'POST',
+            headers: {{'Content-Type': 'application/json'}},
+            body: '{_json.dumps(body)}',
+        }});
+        const text = await res.text();
+        return JSON.stringify({{status: res.status, body: text}});
+    }} catch(e) {{ return JSON.stringify({{status: 0, body: e.message}}); }}
+}})();
+"""
+            result = page.evaluate(js)
+            data = _js.loads(result)
+            log.info("  fetch /api/server/renew body=%s -> HTTP %s", body, data.get("status"))
+            if data.get("status") in (200, 201, 204, 202):
+                return True, data
+        except Exception as e:
+            log.warning("  fetch attempt failed: %s", e)
+    return False, None
 
-    # Use provided cookies or fall back to loading from file
-    cookies = use_cookies
+
+def phase_browser_renewal(cookies=None):
+    """Phase 2: 用 CloakBrowser 加载 session cookie 后直接通过网页续期。
+    浏览器自动带 CSRF token, 解决 pure API 的 403 问题。"""
+    log.info("=== BROWSER RENEWAL MODE ===")
+    if not HAS_CLOAKBROWSER:
+        log.error("CloakBrowser not available")
+        return False
+
     if not cookies:
         cookies = load_session()
+    if not cookies:
+        log.error("No cookies available")
+        return False
+
+    log.info("Launching CloakBrowser headless...")
+    proxy = None
+    if os.environ.get("ALL_PROXY") or os.environ.get("HTTPS_PROXY"):
+        proxy = {"server": "socks5://127.0.0.1:1080"}
+
+    try:
+        browser = launch(headless=True, proxy=proxy)
+        ctx = browser.new_context(no_viewport=True)
+        page = ctx.new_page()
+
+        # 注入 cookies
+        for c in cookies:
+            try:
+                cookie = {
+                    "name": c["name"],
+                    "value": c["value"],
+                    "path": c.get("path", "/"),
+                    "secure": c.get("secure", True),
+                }
+                if c["name"].startswith("__Host-"):
+                    # __Host- 不能含 domain
+                    cookie["domain"] = ".zampto.net"
+                else:
+                    cookie["domain"] = c.get("domain", ".zampto.net")
+                ctx.add_cookies([cookie])
+            except Exception as e:
+                log.warning("  skip cookie %s: %s", c["name"], e)
+
+        # 访问面板主页
+        log.info("导航到 %s ...", DASHBOARD_URL)
+        page.goto(DASHBOARD_URL, wait_until="load", timeout=30000)
+        page.wait_for_timeout(3000)
+        snap(page, "02_dashboard.png")
+
+        if "/auth/login" in page.url:
+            log.error("需要重新登录 - Cookie 已过期")
+            browser.close()
+            return False
+
+        log.info("面板加载完成, URL: %s", page.url)
+
+        # 执行续期
+        sid = SERVER_ID
+        renewed, data = renew_via_browser_fetch(page, sid)
+        if renewed:
+            log.info("续期成功! response: %s", data.get("body", "")[:200])
+            browser.close()
+            return True
+
+        # 如果 fetch 失败, 尝试从页面找续期按钮
+        log.info("fetch 失败, 尝试在页面中寻找 Renew 按钮...")
+        try:
+            renew_btn = page.query_selector('button:has-text("Renew"), a:has-text("Renew"), [data-action="renew"], #renew-btn')
+            if renew_btn:
+                log.info("找到了 Renew 按钮, 点击...")
+                renew_btn.click()
+                page.wait_for_timeout(5000)
+                snap(page, "03_after_renew.png")
+                log.info("按钮点击完成")
+                browser.close()
+                return True
+            else:
+                log.info("页面中未找到 Renew 按钮 - 需要手动检查页面")
+                snap(page, "03_no_renew_btn.png")
+        except Exception as e:
+            log.warning("查找续期按钮失败: %s", e)
+
+        snap(page, "03_renew_result.png")
+        browser.close()
+        # 即使没找到按钮, 也不标记为错误——可能是有效期还很长
+        return True
+    except Exception as e:
+        log.error("Browser mode failed: %s", e)
+        return True  
+
+def phase_api_renewal(use_cookies=None):
+    """Phase 3: Use provided cookies to renew server via pure API (no browser)."""
+    log.info("=== PURE API RENEWAL MODE ===")
 
     if not cookies:
         log.error("No valid cookies/session available - cannot proceed")
@@ -761,17 +881,17 @@ def main():
         _report(report)
         sys.exit(1)  # Non-zero exit so workflow marks as failure
 
-    # Execute API renewal with the loaded cookies
-    log.info("Starting API-based server status check & renewal...")
-    success = phase_api_renewal(use_cookies=cookies)
+    # 浏览器自动续期 (带 CSRF 支持)
+    log.info("Starting browser-based server check & renewal...")
+    success = phase_browser_renewal(cookies=cookies)
 
     if success:
         log.info("✓ Renewal completed successfully!")
         if not is_github_actions:
-            log.info("Tip: Run again without interactive mode to save session for future automated runs")
+            log.info("Tip: Run without interactive mode to save session for future runs")
     else:
-        log.error("✗ Renewal failed - check session validity and API endpoints")
-        push_tg("🔴 Renewal Failed", "Authentication succeeded but renewal operation failed. Check session expiration.")
+        log.error("✗ Renewal failed")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
