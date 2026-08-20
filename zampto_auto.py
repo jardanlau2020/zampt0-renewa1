@@ -371,8 +371,7 @@ def phase_browser_renewal(cookies=None):
         proxy = {"server": "socks5://127.0.0.1:1080"}
 
     try:
-        # uc=True 启用 Undetected Chrome, 自动处理 Cloudflare Turnstile
-        browser = launch(headless=True, uc=True, proxy=proxy)
+        browser = launch(headless=True, proxy=proxy)
         ctx = browser.new_context(no_viewport=True)
         page = ctx.new_page()
 
@@ -924,7 +923,7 @@ def main():
             f"**服务器 ID:** `{SERVER_ID}`\n"
             f"**状态:** 🟢 运行中\n"
             f"**操作:** 🔄 已续期"
-            f"{'\\n**到期:** ' + expiry_str if expiry_str else ''}\n"
+            + (f"\n**到期:** {expiry_str}" if expiry_str else "") + "\n"
             f"\n*浏览器自动续期完成*")
         if not is_github_actions:
             log.info("Tip: Run without interactive mode to save session for future runs")
