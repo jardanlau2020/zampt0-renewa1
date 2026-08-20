@@ -629,7 +629,6 @@ def phase_api_renewal(use_cookies=None):
                 report["action"] = "skipped"
                 log.warning("No expiry field in API response")
 
-        _report(report)
         # If captcha is required, treat as informational (not failure)
         # User has a userscript for manual/semi-auto renewal via browser
         if report.get("error") and "captcha" in str(report["error"]).lower():
@@ -638,7 +637,8 @@ def phase_api_renewal(use_cookies=None):
             # Don't fail - this is expected behavior
             report["action"] = "manual_renewal_required"
             report["error"] = None
-            _report(report)
+        # 只发一次报告（放到 captcha 判断之后，避免重复推送）
+        _report(report)
         return True
 
     except requests.exceptions.RequestException as e:
