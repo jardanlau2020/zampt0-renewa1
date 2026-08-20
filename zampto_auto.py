@@ -912,8 +912,21 @@ def main():
                             from datetime import datetime as dt_cls
                             try:
                                 dt_ob = dt_cls.fromisoformat(exp.replace("Z", "+00:00"))
-                                expiry_str = dt_ob.strftime("%m-%d %H:%M UTC")
-                            except:
+                                now = datetime.now(timezone.utc)
+                                if dt_ob.tzinfo is None:
+                                    dt_ob = dt_ob.replace(tzinfo=timezone.utc)
+                                delta = dt_ob - now
+                                total_s = int(delta.total_seconds())
+                                if total_s > 0:
+                                    d = total_s // 86400
+                                    h = (total_s % 86400) // 3600
+                                    m = (total_s % 3600) // 60
+                                    parts = []
+                                    if d > 0: parts.append(f"{d}d")
+                                    if h > 0: parts.append(f"{h}h")
+                                    parts.append(f"{m}min")
+                                    expiry_str = " ".join(parts)
+                            except Exception:
                                 expiry_str = str(exp)
                         break
         except:
