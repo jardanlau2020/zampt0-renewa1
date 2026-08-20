@@ -669,35 +669,42 @@ def phase_api_renewal(use_cookies=None):
 
 def _report(report):
     status_icon = "\U0001F7E2" if report["status"] == "running" else "\U0001F534"
-    icons = {
-        "started": "\u25B6\ufe0f", "renewed": "\U0001F504", "skipped": "\u23ED\ufe0f",
-        "renew-failed": "\u26A0\ufe0f", "none": "\U0001F4CB",
-        "start-failed": "\u2753", "login-failed": "\U0001F512",
-        "manual_renewal_required": "\U0001F514",
+    action_icons = {
+        "started": "▶️", "renewed": "🔄", "skipped": "⏭️",
+        "renew-failed": "⚠️", "none": "📋",
+        "start-failed": "❓", "login-failed": "🔒",
+        "manual_renewal_required": "🔔",
     }
-    body = (
-        f"\U0001F5A5\ufe0f **Zampto Server Report**\n\n"
-        f"**Server ID:** `{report['server_id']}`\n"
-        f"**Status:** {status_icon} {report['status'].title()}\n"
-        f"**Action:** {icons.get(report['action'], '\u2753')} {report['action']}"
-    )
+    action_cn = {
+        "started": "已启动", "renewed": "已续期", "skipped": "已跳过",
+        "none": "无操作", "manual_renewal_required": "需手动续期",
+    }
+    status_cn = "运行中" if report["status"] == "running" else "已停止"
+    action_text = action_cn.get(report["action"], report["action"])
+
+    lines = [
+        f"**Zampto 服务器报告**",
+        f"",
+        f"**服务器 ID:** `{report['server_id']}`",
+        f"**状态:** {status_icon} {status_cn}",
+        f"**操作:** {action_icons.get(report['action'], '❓')} {action_text}",
+    ]
     if report.get("expiry"):
-        body += f"\n**Expiry:** {report['expiry']}"
+        lines.append(f"**到期:** {report['expiry']}")
     if report.get("error"):
-        body += f"\n**⚠️ Error:** {report['error']}"
-    # Special reminder for manual renewal required
+        lines.append(f"**错误:** {report['error']}")
     if report.get("action") == "manual_renewal_required":
-        body += (
-            f"\n\n\u0001F514 **请手动续期**\n"
-            f"API 续期被 captcha 拦截，请在浏览器中打开 Zampto Dashboard\n"
-            f"使用油猴脚本或手动点击 Renew Server 按钮。"
-        )
-    body += f"\n\n_Generated: {report['timestamp']}_"
+        lines.extend([
+            f"",
+            f"**请手动续期**",
+            f"API 续期需要人机验证，请在浏览器中打开 Zampto 控制台手动续期。"
+        ])
+    lines.append(f"")
+    lines.append(f"*生成: {report['timestamp']}*")
+    body = "\n".join(lines)
 
     log.info("--- Report ---\n%s", body)
-    push_tg("🖥️ Zampto Server Report", body)
-
-    os.makedirs(LOG_DIR, exist_ok=True)
+    push_tg("🖥️ Zampto 服务器报告", body)
     with open(os.path.join(LOG_DIR, "report.json"), "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2, ensure_ascii=False)
     log.info("Report saved")
