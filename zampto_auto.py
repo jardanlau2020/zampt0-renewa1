@@ -342,7 +342,7 @@ def renew_via_browser_fetch(page, sid):
 }})();
 """
             result = page.evaluate(js)
-            data = _js.loads(result)
+            data = _json.loads(result)
             log.info("  fetch /api/server/renew body=%s -> HTTP %s", body, data.get("status"))
             if data.get("status") in (200, 201, 204, 202):
                 return True, data
