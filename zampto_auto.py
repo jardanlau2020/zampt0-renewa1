@@ -98,20 +98,45 @@ def load_session(path=SESSION_FILE):
 
 
 def sync_cookies_to_session(session_obj, cookies):
-    """Sync a list of cookie dicts into a requests.Session."""
+    """Sync a list of cookie dicts into a requests.Session.
+
+    FIX: __Host- prefixed cookies (Laravel) require secure=True, path="/",
+    and NO domain attribute. Python's cookielib rejects them if domain is
+    non-empty, so we pass domain="" for __Host-/__Secure- cookies.
+    """
     session_obj.cookies.clear()
     for c in cookies:
+        name = c["name"]
+        value = c["value"]
         try:
-            session_obj.cookies.set(
-                c["name"],
-                c["value"],
-                domain=c.get("domain", ""),
-                path=c.get("path", "/"),
-                secure=c.get("secure", False),
-                expires=c.get("expires"),
-            )
+            if name.startswith("__Host-"):
+                # __Host- 前缀: 必须 secure=True, path="/", 不能有 domain
+                session_obj.cookies.set(
+                    name, value,
+                    path="/",
+                    domain="",
+                    secure=True,
+                    expires=c.get("expires"),
+                )
+            elif name.startswith("__Secure-"):
+                session_obj.cookies.set(
+                    name, value,
+                    domain=c.get("domain", ""),
+                    path="/",
+                    secure=True,
+                    expires=c.get("expires"),
+                )
+            else:
+                session_obj.cookies.set(
+                    name, value,
+                    domain=c.get("domain", ""),
+                    path=c.get("path", "/"),
+                    secure=c.get("secure", False),
+                    expires=c.get("expires"),
+                )
         except Exception as e:
-            log.warning("Cookie set failed (%s): %s", c.get("name"), e)
+            log.warning("Cookie set failed (%s): %s", name, e)
+    log.info("Synced %d cookies to session", len(cookies))
 
 
 def find_csrf_cookie(cookies):
