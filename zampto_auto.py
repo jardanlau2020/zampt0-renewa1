@@ -911,16 +911,18 @@ def main():
                 for sv in servers:
                     log.info("    检查服务器 id=%s (期望=%s)", sv.get("id"), SERVER_ID)
                     if str(sv.get("id")) == str(SERVER_ID):
-                        exp = sv.get("renewal", "")
-                        log.info("    匹配成功! renewal=%s", exp)
-                        if exp:
-                            from datetime import datetime as dt_cls
+                        exp_raw = sv.get("renewal", "")
+                        log.info("    匹配成功! renewal (原值)=%s", exp_raw)
+                        if exp_raw:
+                            from datetime import datetime as dt_cls, timedelta
                             try:
-                                dt_ob = dt_cls.fromisoformat(exp.replace("Z", "+00:00"))
+                                dt_ob = dt_cls.fromisoformat(exp_raw.replace("Z", "+00:00"))
+                                # renewal 是上次续期时间, 到期 = renewal + 48h
+                                expires_at = dt_ob + timedelta(hours=48)
                                 now = datetime.now(timezone.utc)
-                                if dt_ob.tzinfo is None:
-                                    dt_ob = dt_ob.replace(tzinfo=timezone.utc)
-                                delta = dt_ob - now
+                                if expires_at.tzinfo is None:
+                                    expires_at = expires_at.replace(tzinfo=timezone.utc)
+                                delta = expires_at - now
                                 total_s = int(delta.total_seconds())
                                 if total_s > 0:
                                     d = total_s // 86400
@@ -932,8 +934,12 @@ def main():
                                     parts.append(f"{m}min")
                                     expiry_str = " ".join(parts)
                                     log.info("  到期剩余: %s", expiry_str)
+                                else:
+                                    log.warning("  到期时间已过或解析异常s")
                             except Exception as e:
                                 log.warning("  解析到期时间失败: %s", e)
+                        else:
+                            log.warning("  renewal 字段为空")
                         break
                 else:
                     log.warning("  未在返回中找到服务器 %s", SERVER_ID)
