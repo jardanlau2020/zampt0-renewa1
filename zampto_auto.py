@@ -371,7 +371,8 @@ def phase_browser_renewal(cookies=None):
         proxy = {"server": "socks5://127.0.0.1:1080"}
 
     try:
-        browser = launch(headless=True, proxy=proxy)
+        # uc=True 启用 Undetected Chrome, 自动处理 Cloudflare Turnstile
+        browser = launch(headless=True, uc=True, proxy=proxy)
         ctx = browser.new_context(no_viewport=True)
         page = ctx.new_page()
 
@@ -895,11 +896,36 @@ def main():
 
     if success:
         log.info("✓ Renewal completed successfully!")
+
+        # 查询最新到期时间
+        expiry_str = ""
+        try:
+            api = get_api_session()
+            sync_cookies_to_session(api, cookies)
+            r = api.get(f"{DASHBOARD_URL}/api/servers", timeout=10)
+            if r.status_code == 200:
+                data = r.json()
+                servers = data.get("servers", [])
+                for sv in servers:
+                    if str(sv.get("id")) == str(SERVER_ID):
+                        exp = sv.get("renewal", "")
+                        if exp:
+                            from datetime import datetime as dt_cls
+                            try:
+                                dt_ob = dt_cls.fromisoformat(exp.replace("Z", "+00:00"))
+                                expiry_str = dt_ob.strftime("%m-%d %H:%M UTC")
+                            except:
+                                expiry_str = str(exp)
+                        break
+        except:
+            pass
+
         push_tg("🖥️ Zampto 服务器报告", 
             f"**服务器 ID:** `{SERVER_ID}`\n"
             f"**状态:** 🟢 运行中\n"
-            f"**操作:** 🔄 已续期\n\n"
-            f"*浏览器自动续期完成*")
+            f"**操作:** 🔄 已续期"
+            f"{'\\n**到期:** ' + expiry_str if expiry_str else ''}\n"
+            f"\n*浏览器自动续期完成*")
         if not is_github_actions:
             log.info("Tip: Run without interactive mode to save session for future runs")
     else:
