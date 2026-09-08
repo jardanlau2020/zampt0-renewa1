@@ -95,6 +95,12 @@ jobs:
           insecure = any(params.get(k, ["0"])[0] in ("1", "true", "yes")
                          for k in ("insecure", "allowInsecure", "allow_insecure"))
           alpn = params.get("alpn", [""])[0]
+          security = params.get("security", [""])[0]
+          flow = params.get("flow", [""])[0]
+          public_key = params.get("pbk", [""])[0]
+          fingerprint = params.get("fp", ["chrome"])[0]
+          short_id = params.get("sid", [""])[0]
+          spider_x = urllib.parse.unquote(params.get("spx", [""])[0])
 
           out = {"type": proto, "tag": "proxy-out"}
           if proto == "vmess":
@@ -126,6 +132,23 @@ jobs:
               out["tls"] = {"enabled": True, "server_name": sni or server, "insecure": insecure}
               if alpn:
                   out["tls"]["alpn"] = [alpn]
+              if proto == "vless":
+                  if flow:
+                      out["flow"] = flow
+                  if security == "reality":
+                      if not public_key:
+                          raise ValueError("VLESS Reality link is missing pbk")
+                      out["tls"]["reality"] = {
+                          "enabled": True,
+                          "public_key": public_key,
+                          "short_id": short_id
+                      }
+                      out["tls"]["utls"] = {
+                          "enabled": True,
+                          "fingerprint": fingerprint
+                      }
+                      if spider_x:
+                          out["tls"]["reality"]["spider_x"] = spider_x
               if proto == "tuic":
                   out["udp_relay_mode"] = "native"
                   out["congestion_control"] = "bbr"
