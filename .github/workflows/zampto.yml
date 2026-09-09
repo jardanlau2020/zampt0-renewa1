@@ -2,7 +2,7 @@ name: Zampto 自动续期
 
 on:
   schedule:
-    - cron: '0 0 * * *'  # 每天 UTC 00:00 (北京时间 08:00)
+    - cron: '0 */8 * * *'  # 每8小时 UTC 00/08/16, 確保過期前有反應時間
   workflow_dispatch:
     inputs:
       force_renew:
