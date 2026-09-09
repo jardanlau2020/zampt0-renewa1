@@ -27,6 +27,19 @@ jobs:
       DISPLAY: ":99"
       LIBGL_ALWAYS_SOFTWARE: "1"
       GALLIUM_DRIVER: "llvmpipe"
+      # 全部凭据来自 repo Secrets (Settings -> Secrets and variables -> Actions)。
+      # .github/secrets_chunks.json 已删除: git 不再新增任何凭据。
+      # ⚠ 坑: REST API PUT /actions/secrets 有 7 字符硬上限, >=8 字符即 422
+      #   "validation failed due to an improperly encrypted secret" (实测两个 repo
+      #   一致, 412/456 字符都失败)。必须用 `gh secret set NAME < valuefile` 或
+      #   网页 UI 设置, 不能用 API 手撸。
+      PROXY_URI: ${{ secrets.PROXY_URI }}
+      ZAMPTO_SESSION_SECRET: ${{ secrets.ZAMPTO_SESSION_SECRET }}
+      ZAMPTO_USERNAME: ${{ secrets.ZAMPTO_USERNAME }}
+      ZAMPTO_PASSWORD: ${{ secrets.ZAMPTO_PASSWORD }}
+      ZAMPTO_SERVER_ID: ${{ secrets.ZAMPTO_SERVER_ID }}
+      TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+      TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
 
     steps:
       - uses: actions/checkout@v4
@@ -51,27 +64,25 @@ jobs:
           pip install -r requirements.txt
           python -c "from cloakbrowser import ensure_binary; ensure_binary()"
 
-      - name: "🧩 组装分块值 (secrets_chunks.json)"
+      - name: "🔑 校验 Secrets 配置"
         run: |
           set -e
-          F=".github/secrets_chunks.json"
-          [ -f "$F" ] || { echo "[ERROR] $F missing"; exit 1; }
-          P="$(python3 -c "import json;d=json.load(open('$F'));print(''.join(d['CXY']))")"
-          S="$(python3 -c "import json;d=json.load(open('$F'));print(''.join(d['CSE']))")"
-          U="$(python3 -c "import json;d=json.load(open('$F'));print(''.join(d['ZU']))")"
-          PW="$(python3 -c "import json;d=json.load(open('$F'));print(''.join(d['ZP']))")"
-          SID="$(python3 -c "import json;d=json.load(open('$F'));print(''.join(d['ZI']))")"
-          [ -n "$P" ] || { echo "[ERROR] PROXY chunks missing"; exit 1; }
-          [ -n "$S" ] || { echo "[ERROR] SESSION chunks missing"; exit 1; }
-          [ -n "$U" ] || { echo "[ERROR] USERNAME chunks missing"; exit 1; }
-          [ -n "$PW" ] || { echo "[ERROR] PASSWORD chunks missing"; exit 1; }
-          [ -n "$SID" ] || { echo "[ERROR] SERVER_ID chunks missing"; exit 1; }
-          echo "PROXY_URI=$P" >> "$GITHUB_ENV"
-          echo "ZAMPTO_SESSION_SECRET=$S" >> "$GITHUB_ENV"
-          echo "ZAMPTO_USERNAME=$U" >> "$GITHUB_ENV"
-          echo "ZAMPTO_PASSWORD=$PW" >> "$GITHUB_ENV"
-          echo "ZAMPTO_SERVER_ID=$SID" >> "$GITHUB_ENV"
-          echo "[OK] reassembled PROXY_URI (${#P}), SESSION_SECRET (${#S}), USERNAME (${#U}), PASSWORD (${#PW}), SERVER_ID (${#SID})"
+          missing=0
+          for name in PROXY_URI ZAMPTO_SESSION_SECRET ZAMPTO_USERNAME ZAMPTO_PASSWORD ZAMPTO_SERVER_ID; do
+            val="${!name}"
+            if [ -z "$val" ]; then
+              echo "[ERROR] Secret $name 未配置! 请到 Settings -> Secrets and variables -> Actions 添加"
+              missing=1
+            else
+              echo "[OK] $name 已配置 (${#val} chars)"
+            fi
+          done
+          if [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
+            echo "[OK] Telegram 通知已配置"
+          else
+            echo "[WARN] Telegram 未配置 (TG_BOT_TOKEN / TG_CHAT_ID), 失败将无法推送提醒"
+          fi
+          [ "$missing" -eq 0 ] || exit 1
 
       - name: "🌐 启动代理 (多格式: hysteria2/hy2/tuic/vless/vmess)"
         env:
@@ -268,9 +279,7 @@ jobs:
 
       - name: 🔄 运行续期脚本
         env:
-          # ZAMPTO_USERNAME/PASSWORD/SERVER_ID/SESSION_SECRET 均由組裝步寫入 GITHUB_ENV，此處唔設 step-level，let inherit
-          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
-          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          # ZAMPTO_* / PROXY_URI / TG_* 均为 job-level env, 直接继承
           FORCE_RENEW: ${{ github.event.inputs.force_renew || 'false' }}
           ENABLE_RECORDING: ${{ github.event.inputs.enable_recording || 'false' }}
         run: |
