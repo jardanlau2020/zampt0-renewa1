@@ -58,11 +58,20 @@ jobs:
           [ -f "$F" ] || { echo "[ERROR] $F missing"; exit 1; }
           P="$(python3 -c "import json;d=json.load(open('$F'));print(''.join(d['CXY']))")"
           S="$(python3 -c "import json;d=json.load(open('$F'));print(''.join(d['CSE']))")"
+          U="$(python3 -c "import json;d=json.load(open('$F'));print(''.join(d['ZU']))")"
+          PW="$(python3 -c "import json;d=json.load(open('$F'));print(''.join(d['ZP']))")"
+          SID="$(python3 -c "import json;d=json.load(open('$F'));print(''.join(d['ZI']))")"
           [ -n "$P" ] || { echo "[ERROR] PROXY chunks missing"; exit 1; }
           [ -n "$S" ] || { echo "[ERROR] SESSION chunks missing"; exit 1; }
+          [ -n "$U" ] || { echo "[ERROR] USERNAME chunks missing"; exit 1; }
+          [ -n "$PW" ] || { echo "[ERROR] PASSWORD chunks missing"; exit 1; }
+          [ -n "$SID" ] || { echo "[ERROR] SERVER_ID chunks missing"; exit 1; }
           echo "PROXY_URI=$P" >> "$GITHUB_ENV"
           echo "ZAMPTO_SESSION_SECRET=$S" >> "$GITHUB_ENV"
-          echo "[OK] reassembled PROXY_URI (${#P} chars) and ZAMPTO_SESSION_SECRET (${#S} chars)"
+          echo "ZAMPTO_USERNAME=$U" >> "$GITHUB_ENV"
+          echo "ZAMPTO_PASSWORD=$PW" >> "$GITHUB_ENV"
+          echo "ZAMPTO_SERVER_ID=$SID" >> "$GITHUB_ENV"
+          echo "[OK] reassembled PROXY_URI (${#P}), SESSION_SECRET (${#S}), USERNAME (${#U}), PASSWORD (${#PW}), SERVER_ID (${#SID})"
 
       - name: "🌐 启动代理 (多格式: hysteria2/hy2/tuic/vless/vmess)"
         env:
@@ -236,10 +245,7 @@ jobs:
 
       - name: 🔄 运行续期脚本
         env:
-          ZAMPTO_USERNAME: ${{ secrets.ZAMPTO_USERNAME }}
-          ZAMPTO_PASSWORD: ${{ secrets.ZAMPTO_PASSWORD }}
-          ZAMPTO_SERVER_ID: ${{ secrets.ZAMPTO_SERVER_ID }}
-          # ZAMPTO_SESSION_SECRET 由 group step 寫入 GITHUB_ENV（chunked），step-level 唔設，let it inherit
+          # ZAMPTO_USERNAME/PASSWORD/SERVER_ID/SESSION_SECRET 均由組裝步寫入 GITHUB_ENV，此處唔設 step-level，let inherit
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           FORCE_RENEW: ${{ github.event.inputs.force_renew || 'false' }}
