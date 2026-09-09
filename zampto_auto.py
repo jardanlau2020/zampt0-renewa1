@@ -46,6 +46,28 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(me
 log = logging.getLogger("zampto")
 
 
+def mask_headers(headers):
+    """把敏感 header 的值遮罩后再打日志。
+
+    GitHub Actions 的 log 在 public repo 上任何人都能看。x-csrf-token /
+    x-xsrf-token / authorization / cookie 里带的是 Laravel signed session
+    cookie (129 字符), 打出来等于把登录凭证公开。run 34334974537 就是这么
+    把 zampto_csrf 完整印到 log 里的, 所以要在这里统一遮罩。
+    返回 (mask 后的 dict, 原始长度信息) —— 长度对调试有用, 值不要。
+    """
+    if not headers:
+        return headers
+    sensitive = {"x-csrf-token", "x-xsrf-token", "x-csrf-token",
+                 "authorization", "cookie", "set-cookie"}
+    out = {}
+    for k, v in headers.items():
+        if k.lower() in sensitive and isinstance(v, str) and v:
+            out[k] = "<redacted len=%d>" % len(v)
+        else:
+            out[k] = v
+    return out
+
+
 def push_tg(title, body):
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
         log.warning("Telegram config missing, skipping send")
@@ -1156,7 +1178,7 @@ def phase_browser_renewal(cookies=None):
                         # 打印页面 JS 用的 headers, 帮我下次复现正确路径
                         for i, req in enumerate(captured_renew_requests):
                             log.info("  [REQ %d] url=%s headers=%s post_data=%s",
-                                     i, req["url"], req["headers"], req["post_data"])
+                                     i, req["url"], mask_headers(req["headers"]), req["post_data"])
                         browser.close()
                         log.info("✅ 续期成功 (页面 JS 触发的 renew 请求成功)")
                         return "renewed"
@@ -1490,8 +1512,8 @@ def phase_api_renewal(use_cookies=None):
                             continue
                         # 首个 body: 打印 CSRF 前缀 + 现有 session cookies 名, 帮助诊断
                         if body is body_variants[0]:
-                            log.info("  [DIAG] csrf_token prefix=%r len=%d, session cookies=%s",
-                                     fresh_csrf[:50], len(fresh_csrf),
+                            log.info("  [DIAG] csrf_token len=%d (值不打印, log 在 public repo 可见), session cookies=%s",
+                                     len(fresh_csrf or ""),
                                      [(c.name, len(c.value), c.domain) for c in api_session.cookies])
                         try:
                             # Laravel 机制: zampto_csrf cookie 值是加密+URL编码的 token。
@@ -1572,7 +1594,7 @@ def phase_api_renewal(use_cookies=None):
                                             renew_success = True  # CSRF 已通过, 是业务错误
                                             break
                                     except Exception as e:
-                                        log.warning("    Request failed (%s %s): %s", hdr, tok[:20], e)
+                                        log.warning("    Request failed (hdr=%s tokLen=%d): %s", hdr, len(tok or ""), e)
                                 if renew_success:
                                     break
                             if renew_success:
