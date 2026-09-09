@@ -324,7 +324,7 @@ def dismiss_blocking_popups(page):
                 }
             }
             return n;
-        }();
+        }
         """)
         if text_removed:
             removed += text_removed
@@ -350,7 +350,7 @@ def dismiss_blocking_popups(page):
                 } catch(e) {}
             }
             return n;
-        }();
+        }
         """)
         if overlay_removed:
             removed += overlay_removed
@@ -1075,7 +1075,9 @@ def phase_browser_renewal(cookies=None):
         log.info("服务器页加载完成, URL: %s", page.url)
 
         # 执行续期
-        sid = SERVER_ID
+        # 服务端要求 server_id 为整数: 传字符串 "15629" 会直接回 400 "Invalid server ID"
+        # (2026-09-09 run 34333259509 复现), 因此这里显式转成 int
+        sid = int(SERVER_ID) if SERVER_ID.isdigit() else SERVER_ID
         # 在导航到服务器页之后, 浏览器可能已用新 Set-Cookie 覆盖了注入的 CSRF cookie
         # 重新从 ctx.cookies() 读取最新的 token, 确保 explicit_csrf 是当前最新值
         try:
@@ -1593,17 +1595,25 @@ def phase_api_renewal(use_cookies=None):
                 report["action"] = "skipped"
                 log.warning("No expiry field in API response")
 
-        # If captcha is required, treat as informational (not failure)
-        # User has a userscript for manual/semi-auto renewal via browser
+        # Captcha 挡住时: 照样发报告说明情况, 但不再把 action 改成"合法"状态。
+        # 续期没发生就应该让 workflow 报 failure —— 静默 green 会让人以为还在自动续期,
+        # 实际服务器已到期。TG 报告里会写清楚需要手动处理。
         if report.get("error") and "captcha" in str(report["error"]).lower():
             log.info("ℹ️ Captcha required - please use the userscript in your browser to renew")
-            log.info("    The script will continue to monitor and send Telegram reminders")
-            # Don't fail - this is expected behavior
+            log.info("    Report is pushed; this run is marked as failure so it stays visible")
             report["action"] = "manual_renewal_required"
-            report["error"] = None
         # 只发一次报告（放到 captcha 判断之后，避免重复推送）
         _report(report)
-        return True
+        # 成功判定: 只有 (a) 真的续期成功, 或 (b) 到期时间充足而合法跳过, 才算成功。
+        # 之前这里无条件 return True —— 续期失败时 workflow 仍显示 success,
+        # cron 会静默失败。与 IceHost 那次 6h/600 差值永远 miss threshold 是同一类 bug
+        # (成功判定和实际操作脱节)。
+        _action = report.get("action")
+        _err = report.get("error")
+        if _action in ("renewed", "skipped") and not _err:
+            return True
+        log.error("API 续期未真正完成 (action=%r, error=%r)", _action, _err)
+        return False
 
     except requests.exceptions.RequestException as e:
         log.error("API request error: %s", e)
