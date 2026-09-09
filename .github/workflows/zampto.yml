@@ -132,10 +132,33 @@ jobs:
               out["uuid"] = vm.get("id", "")
               out["alter_id"] = int(vm.get("aid", "0"))
               out["security"] = vm.get("scy", "auto") or "auto"
-              out["tls"] = {"enabled": False, "server_name": sni or vm.get("host", ""), "insecure": insecure}
+              vm_host = vm.get("host", "") or vm.get("sni", "") or out["server"]
+              insecure = insecure or vm.get("insecure", "0") in ("1", "true", "yes")
+              out["tls"] = {"enabled": False, "server_name": sni or vm_host, "insecure": insecure}
               if vm.get("tls") == "tls" or vm.get("sni") or vm.get("host"):
                   out["tls"]["enabled"] = True
-                  out["tls"]["server_name"] = sni or vm.get("sni") or vm.get("host") or out["server"]
+                  out["tls"]["server_name"] = sni or vm_host
+                  # uTLS 指纹: 优先 vmess JSON 里的 fp, 再退回到链接 query 的 fp
+                  vm_fp = vm.get("fp", "") or fingerprint
+                  if vm_fp:
+                      out["tls"]["utls"] = {"enabled": True, "fingerprint": vm_fp}
+                  vm_alpn = vm.get("alpn", "")
+                  if vm_alpn:
+                      out["tls"]["alpn"] = [x.strip() for x in vm_alpn.split(",") if x.strip()]
+              # 传输层: ws / grpc / http / tcp
+              net = (vm.get("net", "tcp") or "tcp").lower()
+              if net == "ws":
+                  # sing-box 1.10.7 拒绝带 query string 的 ws path (会回 404),
+                  # 实测节点服务器对裸 path 同样接受, 因此这里剥掉 "?..."
+                  out["transport"] = {
+                      "type": "ws",
+                      "path": vm.get("path", "/").split("?", 1)[0] or "/",
+                      "headers": {"Host": vm_host},
+                  }
+              elif net == "grpc":
+                  out["transport"] = {"type": "grpc", "service_name": vm.get("path", "")}
+              elif net == "http":
+                  out["transport"] = {"type": "http", "path": vm.get("path", "/"), "host": vm_host}
           else:
               password_raw, server_part = main.rsplit("@", 1)
               password = urllib.parse.unquote(password_raw)
