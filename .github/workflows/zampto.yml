@@ -51,7 +51,7 @@ jobs:
           pip install -r requirements.txt
           python -c "from cloakbrowser import ensure_binary; ensure_binary()"
 
-            - name: "🧩 组装分块值 (secrets_chunks.json)"
+      - name: "🧩 组装分块值 (secrets_chunks.json)"
         run: |
           set -e
           F=".github/secrets_chunks.json"
@@ -64,7 +64,7 @@ jobs:
           echo "ZAMPTO_SESSION_SECRET=$S" >> "$GITHUB_ENV"
           echo "[OK] reassembled PROXY_URI (${#P} chars) and ZAMPTO_SESSION_SECRET (${#S} chars)"
 
-- name: "🌐 启动代理 (多格式: hysteria2/hy2/tuic/vless/vmess)"
+      - name: "🌐 启动代理 (多格式: hysteria2/hy2/tuic/vless/vmess)"
         env:
           TUIC_URI: ${{ secrets.TUIC_URI }}
         run: |
