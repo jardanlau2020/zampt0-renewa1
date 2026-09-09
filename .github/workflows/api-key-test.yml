@@ -18,26 +18,34 @@ jobs:
         run: |
           pip install -q requests
           python3 << 'PYEOF'
-          import requests
+          import requests, json, base64
           KEY = "zamptonet-78c0c63110f7c100d9170e5d8acf58d7"
+          raw = json.load(open(".github/secrets_chunks.json"))
+          sess_b64 = "".join(raw["CSE"])
+          sess = json.loads(base64.b64decode(sess_b64))
           UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126.0 Safari/537.36"}
+          s = requests.Session()
+          s.headers.update(UA)
+          for c in sess["cookies"]:
+              s.cookies.set(c["name"], c["value"], domain=c.get("domain","").lstrip("."))
+          s.get("https://dash.zampto.net/server?id=15629", timeout=30)
+          csrf = s.cookies.get("zampto_csrf","")
+          print("csrf len:", len(csrf))
           def hit(method, path, body=None, extra=None, tag=""):
-              h = dict(UA); h.update(extra or {})
+              h = {"X-CSRF-Token": csrf}
+              h.update(extra or {})
               try:
-                  r = requests.request(method, "https://dash.zampto.net"+path, json=body, headers=h, timeout=30)
+                  r = s.request(method, "https://dash.zampto.net"+path, json=body, headers=h, timeout=30)
                   print(f"{method} {path} [{tag}] -> {r.status_code} {r.text[:150]}")
               except Exception as e:
                   print(f"{method} {path} [{tag}] ERR {str(e)[:100]}")
-          print("=== 0. no-auth baseline (IP reputation) ===")
-          hit("GET", "/api/user", tag="no-auth")
-          print("=== 1. Bearer ===")
-          for p in ["/api/server/renew","/api/servers/renew","/api/server/15629/renew"]:
-              hit("POST", p, extra={"Authorization":"Bearer "+KEY}, tag="bearer")
-          print("=== 2. X-API-Key + body ===")
-          for p in ["/api/server/renew","/api/servers/renew"]:
-              hit("POST", p, {"server_id":"15629"}, extra={"X-API-Key":KEY}, tag="xapikey")
-          print("=== 3. body api_key ===")
-          hit("POST", "/api/server/renew", {"server_id":"15629","api_key":KEY}, tag="body")
-          print("=== 4. query ===")
-          hit("GET", "/api/server/renew?api_key="+KEY, tag="query")
+          print("=== A. session only (baseline) ===")
+          hit("GET", "/api/user", {"email":"jardanlau@gmail.com"} if False else None, tag="session")
+          hit("POST", "/api/server/renew", {"server_id":"15629"}, tag="session")
+          print("=== B. session + Bearer key ===")
+          hit("POST", "/api/server/renew", {"server_id":"15629"}, extra={"Authorization":"Bearer "+KEY}, tag="sess+key")
+          print("=== C. session + X-API-Key ===")
+          hit("POST", "/api/server/renew", {"server_id":"15629"}, extra={"X-API-Key":KEY}, tag="sess+xk")
+          print("=== D. session + key + body api_key ===")
+          hit("POST", "/api/server/renew", {"server_id":"15629","api_key":KEY}, tag="sess+body")
           PYEOF
