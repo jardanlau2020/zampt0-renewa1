@@ -287,6 +287,101 @@ def click_btn(page, selector):
     return False
 
 
+def dismiss_blocking_popups(page):
+    """移除遮擋 Turnstile checkbox 的彈窗 (privacy/cookie/consent).
+
+    策略:
+    1. 按文字內容匹配 privacy 彈窗並移除
+    2. 按 z-index 和尺寸匹配高層覆蓋彈窗並移除
+    3. 嘗試點擊 × 關閉按鈕 (擬人化)
+
+    返回移除的 element 數量。
+    """
+    removed = 0
+    try:
+        # 策略 1: 按文字內容匹配 privacy 彈窗
+        text_removed = page.evaluate("""
+        () => {
+            let n = 0;
+            const privacyTexts = [
+                'how your data is used',
+                'privacy settings',
+                'partner list',
+                'legitimate interest',
+                'your privacy preferences',
+            ];
+            const all = document.querySelectorAll(
+                'div, section, aside, dialog, [role="dialog"], [role="alertdialog"], [class*="modal"], [class*="overlay"], [class*="popup"]'
+            );
+            for (const el of all) {
+                const txt = (el.innerText || '').toLowerCase();
+                for (const key of privacyTexts) {
+                    if (txt.includes(key) && el.children.length < 50) {
+                        el.remove();
+                        n++;
+                        break;
+                    }
+                }
+            }
+            return n;
+        }();
+        """)
+        if text_removed:
+            removed += text_removed
+            log.info("🧹 移除 privacy 彈窗: %d", text_removed)
+
+        # 策略 2: 按 z-index 和尺寸匹配高層覆蓋彈窗
+        overlay_removed = page.evaluate("""
+        () => {
+            let n = 0;
+            const all = document.querySelectorAll('*');
+            for (const el of all) {
+                try {
+                    const style = window.getComputedStyle(el);
+                    const z = parseInt(style.zIndex || '0');
+                    const pos = style.position;
+                    if ((pos === 'fixed' || pos === 'absolute') && z >= 900) {
+                        const r = el.getBoundingClientRect();
+                        if (r.width > 150 && r.height > 80 && r.width > window.innerWidth * 0.2) {
+                            el.remove();
+                            n++;
+                        }
+                    }
+                } catch(e) {}
+            }
+            return n;
+        }();
+        """)
+        if overlay_removed:
+            removed += overlay_removed
+            log.info("🧹 移除高層彈窗: %d", overlay_removed)
+
+        # 策略 3: 嘗試點擊 × 關閉按鈕 (擬人化)
+        if removed == 0:
+            try:
+                close_btns = page.query_selector_all(
+                    'button[aria-label="Close"], button[aria-label="close"], .close, [class*="close"], button[class*="dismiss"]'
+                )
+                for btn in close_btns:
+                    try:
+                        if btn.is_visible():
+                            btn.click()
+                            log.info("🔘 點擊了 × 關閉按鈕")
+                            removed += 1
+                            break
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        if removed:
+            page.wait_for_timeout(500)
+    except Exception as e:
+        log.warning("dismiss_blocking_popups 失敗: %s", e)
+
+    return removed
+
+
 def solve_turnstile(page, max_wait=90, click_after=8):
     """等待 Cloudflare Turnstile 验证自动通过; 若超时未通过, 用坐标点击 iframe 复选框。
 
@@ -485,6 +580,7 @@ def solve_turnstile(page, max_wait=90, click_after=8):
             # 4. 若等待已超过 click_after 秒仍未通过, 用坐标点击 iframe 复选框
             if (has_frame and iframe_first_seen is not None
                     and _time.time() - iframe_first_seen >= click_after):
+                dismiss_blocking_popups(page)
                 iframe_el, box = _find_iframe_box()
                 if box:
                     # checkbox 在 Turnstile widget 左上区域
@@ -1035,6 +1131,8 @@ def phase_browser_renewal(cookies=None):
                     log.info("force click 成功")
                 page.wait_for_timeout(3000)
                 snap(page, "03_after_renew.png")
+                # 移除遮擋 Turnstile 的彈窗 (privacy/cookie/consent)
+                dismiss_blocking_popups(page)
                 # 处理 Turnstile 安全验证 (Zampto 续期需要人机验证)
                 # v3 solve_turnstile: 先等 8s 自动通过, 失败后多次坐标点击 iframe checkbox (不同 offset)
                 turnstile_ok = solve_turnstile(page, max_wait=90, click_after=8)
