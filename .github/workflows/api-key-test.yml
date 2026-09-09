@@ -9,47 +9,35 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: 🐍 Python 3.12
+      - name: Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
-      - name: 🔑 API-key sweep
+      - name: Sweep
         run: |
-          set -e
-          KEY="$(python3 -c "import json;print(''.join(json.load(open('.github/secrets_chunks.json'))['CAK']))")"
-          echo "KEY len: ${#KEY}  head: ${KEY:0:6}..."
           pip install -q requests
-          python3 - "$KEY" <<'PYEOF'
-import requests, sys, json
-key = sys.argv[1]
-UA = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126.0 Safari/537.36'}
-def hit(method, path, body=None, **kw):
-    hdrs = dict(UA)
-    hdrs.update(kw.get('extra', {}))
-    try:
-        r = requests.request(method, 'https://dash.zampto.net'+path, json=body, headers=hdrs, timeout=30)
-        print(f'{method} {path} {kw.get("tag","")} -> {r.status_code} {r.text[:160]}')
-        return r
-    except Exception as e:
-        print(f'{method} {path} ERR {str(e)[:120]}')
-        return None
-
-print('=== Phase 1: no-auth probes (IP reputation check) ===')
-hit('GET', '/api/user', tag='no-auth')
-
-print('\n=== Phase 2: Bearer auth, no body ===')
-for p in ['/api/server/renew','/api/servers/renew','/api/server/15629/renew','/api/v1/server/renew']:
-    hit('POST', p, extra={'Authorization': f'Bearer {key}'}, tag='bearer')
-
-print('\n=== Phase 3: X-API-Key + body ===')
-for p in ['/api/server/renew','/api/servers/renew']:
-    hit('POST', p, {'server_id':'15629'}, extra={'X-API-Key': key}, tag='xapikey')
-
-print('\n=== Phase 4: api_key in body ===')
-hit('POST', '/api/server/renew', {'server_id':'15629','api_key':key}, tag='body')
-
-print('\n=== Phase 5: query param ===')
-for p in [f'/api/server/renew?key={key}', f'/api/server/renew&api_key={key}']:
-    hit('GET', p, tag='qparam')
-PYEOF
+          python3 << 'PYEOF'
+          import requests
+          KEY = "zamptonet-78c0c63110f7c100d9170e5d8acf58d7"
+          UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126.0 Safari/537.36"}
+          def hit(method, path, body=None, extra=None, tag=""):
+              h = dict(UA); h.update(extra or {})
+              try:
+                  r = requests.request(method, "https://dash.zampto.net"+path, json=body, headers=h, timeout=30)
+                  print(f"{method} {path} [{tag}] -> {r.status_code} {r.text[:150]}")
+              except Exception as e:
+                  print(f"{method} {path} [{tag}] ERR {str(e)[:100]}")
+          print("=== 0. no-auth baseline (IP reputation) ===")
+          hit("GET", "/api/user", tag="no-auth")
+          print("=== 1. Bearer ===")
+          for p in ["/api/server/renew","/api/servers/renew","/api/server/15629/renew"]:
+              hit("POST", p, extra={"Authorization":"Bearer "+KEY}, tag="bearer")
+          print("=== 2. X-API-Key + body ===")
+          for p in ["/api/server/renew","/api/servers/renew"]:
+              hit("POST", p, {"server_id":"15629"}, extra={"X-API-Key":KEY}, tag="xapikey")
+          print("=== 3. body api_key ===")
+          hit("POST", "/api/server/renew", {"server_id":"15629","api_key":KEY}, tag="body")
+          print("=== 4. query ===")
+          hit("GET", "/api/server/renew?api_key="+KEY, tag="query")
+          PYEOF
