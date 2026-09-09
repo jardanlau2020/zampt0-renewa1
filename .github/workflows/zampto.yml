@@ -51,59 +51,20 @@ jobs:
           pip install -r requirements.txt
           python -c "from cloakbrowser import ensure_binary; ensure_binary()"
 
-      - name: "🧩 组装分块 Secrets (chunked secrets)"
-        env:
-          CSE_00: ${{ secrets.CSE_00 }}
-          CSE_01: ${{ secrets.CSE_01 }}
-          CSE_02: ${{ secrets.CSE_02 }}
-          CSE_03: ${{ secrets.CSE_03 }}
-          CSE_04: ${{ secrets.CSE_04 }}
-          CSE_05: ${{ secrets.CSE_05 }}
-          CSE_06: ${{ secrets.CSE_06 }}
-          CSE_07: ${{ secrets.CSE_07 }}
-          CSE_08: ${{ secrets.CSE_08 }}
-          CSE_09: ${{ secrets.CSE_09 }}
-          CSE_10: ${{ secrets.CSE_10 }}
-          CSE_11: ${{ secrets.CSE_11 }}
-          CSE_12: ${{ secrets.CSE_12 }}
-          CSE_13: ${{ secrets.CSE_13 }}
-          CSE_14: ${{ secrets.CSE_14 }}
-          CSE_15: ${{ secrets.CSE_15 }}
-          CSE_16: ${{ secrets.CSE_16 }}
-          CSE_17: ${{ secrets.CSE_17 }}
-          CSE_18: ${{ secrets.CSE_18 }}
-          CSE_19: ${{ secrets.CSE_19 }}
-          CSE_20: ${{ secrets.CSE_20 }}
-          CSE_21: ${{ secrets.CSE_21 }}
-          CSE_22: ${{ secrets.CSE_22 }}
-          CSE_23: ${{ secrets.CSE_23 }}
-          CSE_N: ${{ secrets.CSE_N }}
-          CXY_00: ${{ secrets.CXY_00 }}
-          CXY_01: ${{ secrets.CXY_01 }}
-          CXY_02: ${{ secrets.CXY_02 }}
-          CXY_03: ${{ secrets.CXY_03 }}
-          CXY_04: ${{ secrets.CXY_04 }}
-          CXY_05: ${{ secrets.CXY_05 }}
-          CXY_06: ${{ secrets.CXY_06 }}
-          CXY_07: ${{ secrets.CXY_07 }}
-          CXY_08: ${{ secrets.CXY_08 }}
-          CXY_09: ${{ secrets.CXY_09 }}
-          CXY_10: ${{ secrets.CXY_10 }}
-          CXY_11: ${{ secrets.CXY_11 }}
-          CXY_N: ${{ secrets.CXY_N }}
+            - name: "🧩 组装分块值 (secrets_chunks.json)"
         run: |
           set -e
-          # GitHub repo-secret API 对值有 19 字符硬上限 -> 长值拆块存放, 此处重组
-          P=""; N=$(seq 1 "$CXY_N")
-          for i in $(seq -w 1 "$CXY_N"); do P="${P}${CXY_$(printf '%02d' "$i")}"; done
-          S=""; for i in $(seq -w 1 "$CSE_N"); do S="${S}${CSE_$(printf '%02d' "$i")}"; done
-          if [ -z "$P" ]; then echo "[ERROR] PROXY chunks missing"; exit 1; fi
-          if [ -z "$S" ]; then echo "[ERROR] SESSION chunks missing"; exit 1; fi
+          F=".github/secrets_chunks.json"
+          [ -f "$F" ] || { echo "[ERROR] $F missing"; exit 1; }
+          P="$(python3 -c "import json;d=json.load(open('$F'));print(''.join(d['CXY']))")"
+          S="$(python3 -c "import json;d=json.load(open('$F'));print(''.join(d['CSE']))")"
+          [ -n "$P" ] || { echo "[ERROR] PROXY chunks missing"; exit 1; }
+          [ -n "$S" ] || { echo "[ERROR] SESSION chunks missing"; exit 1; }
           echo "PROXY_URI=$P" >> "$GITHUB_ENV"
           echo "ZAMPTO_SESSION_SECRET=$S" >> "$GITHUB_ENV"
           echo "[OK] reassembled PROXY_URI (${#P} chars) and ZAMPTO_SESSION_SECRET (${#S} chars)"
 
-      - name: "🌐 启动代理 (多格式: hysteria2/hy2/tuic/vless/vmess)"
+- name: "🌐 启动代理 (多格式: hysteria2/hy2/tuic/vless/vmess)"
         env:
           TUIC_URI: ${{ secrets.TUIC_URI }}
         run: |
