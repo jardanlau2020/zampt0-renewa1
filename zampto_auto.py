@@ -22,13 +22,24 @@ except ImportError:
     print("requests not installed. Install: pip install requests")
     raise
 
-# Try importing cloakbrowser only if needed
+# 2026-09-16: cloakbrowser 上游 binary v146 在 ubuntu-24.04 runner segfault(exit 139,
+# ensure_binary 一跑就炸), 改用 playwright chromium shim 頂替 launch()。
+# API 兼容位: new_page() / new_context(no_viewport=True) / close() 同 proxy 格式。
 HAS_CLOAKBROWSER = False
-try:
-    from cloakbrowser import launch
-    HAS_CLOAKBROWSER = True
-except Exception:
-    pass
+_PW = None
+def launch(headless=True, proxy=None):
+    from playwright.sync_api import sync_playwright
+    global _PW
+    if _PW is None:
+        _PW = sync_playwright().start()
+    kw = {
+        "headless": headless,
+        "args": ["--disable-blink-features=AutomationControlled", "--no-sandbox"],
+    }
+    if proxy:
+        kw["proxy"] = proxy
+    return _PW.chromium.launch(**kw)
+HAS_CLOAKBROWSER = True
 
 USERNAME = os.getenv("ZAMPTO_USERNAME", "")
 PASSWORD = os.getenv("ZAMPTO_PASSWORD", "")

@@ -62,7 +62,7 @@ jobs:
       - name: 📦 安装 Python 依赖
         run: |
           pip install -r requirements.txt
-          python -c "from cloakbrowser import ensure_binary; ensure_binary()"
+          python -m playwright install chromium
 
       - name: "🔑 校验 Secrets 配置"
         run: |
