@@ -286,6 +286,7 @@ jobs:
           Xvfb :99 -screen 0 1280x720x24 +extension RANDR &
           XVFB_PID=$!
           sleep 2
+          export DISPLAY=:99
 
           RECORD_PID=""
           if [ "$ENABLE_RECORDING" = "true" ]; then

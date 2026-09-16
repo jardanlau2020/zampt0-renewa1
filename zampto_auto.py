@@ -999,7 +999,7 @@ def phase_browser_renewal(cookies=None):
         proxy = {"server": "socks5://127.0.0.1:1080"}
 
     try:
-        browser = launch(headless=True, proxy=proxy)
+        browser = launch(headless=os.getenv("ZAMPTO_HEADLESS", "false").lower() == "true", proxy=proxy)
         ctx = browser.new_context(no_viewport=True)
         page = ctx.new_page()
 
