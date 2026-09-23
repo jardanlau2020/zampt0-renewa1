@@ -42,10 +42,10 @@ jobs:
       TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: 🐍 配置 Python 3.12
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.12'
 
@@ -317,7 +317,7 @@ jobs:
 
       - name: 📸 上传截图
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         env:
           # 显式清空代理环境变量给 upload-artifact@v4 用 (Node undici 解析代理 URL,
           # socks5h:// 它不支持会抛 "Invalid URL protocol" 错误).
