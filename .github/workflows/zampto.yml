@@ -1,8 +1,13 @@
 name: Zampto 自动续期
 
 on:
-  schedule:
-    - cron: '0 */8 * * *'  # 每8小时 UTC 00/08/16, 確保過期前有反應時間
+  # ⏸ 2026-09-28 暫停排程 — 站方新增反 VPN/代理偵測：帶 session 的請求一律回
+  #   403 {"error":"Access blocked","reason":"VPN or proxy detected"} 並跳 /blocked
+  #   （實測矩陣見 commit f8d772c：帶 cookie 就封，唔帶 cookie 就正常，代理/直連一樣）。
+  #   即係「人手撳得到、機械人撳唔到」，繼續跑只會每 8 小時一條紅燈。
+  #   要恢復：取消下面註解（或用 workflow_dispatch 手動跑）。
+  # schedule:
+  #   - cron: '0 */8 * * *'  # 每8小时 UTC 00/08/16, 確保過期前有反應時間
   workflow_dispatch:
     inputs:
       force_renew:
@@ -29,10 +34,10 @@ jobs:
       GALLIUM_DRIVER: "llvmpipe"
       # 全部凭据来自 repo Secrets (Settings -> Secrets and variables -> Actions)。
       # .github/secrets_chunks.json 已删除: git 不再新增任何凭据。
-      # ⚠ 坑: REST API PUT /actions/secrets 有 7 字符硬上限, >=8 字符即 422
-      #   "validation failed due to an improperly encrypted secret" (实测两个 repo
-      #   一致, 412/456 字符都失败)。必须用 `gh secret set NAME < valuefile` 或
-      #   网页 UI 设置, 不能用 API 手撸。
+      # ⚠ 舊註解「REST API PUT /actions/secrets 有 7 字符硬上限」已於 2026-09-28 證偽:
+      #   用 PyNaCl SealedBox (libsodium sealed box) 加密後 PUT 完全正常 ——
+      #   當日成功寫入 182 字的 PROXY_URI。之前 422 的原因是用錯 Box 而非 SealedBox。
+      #   (curl/gh 都可以, 唔一定要用網頁 UI。)
       PROXY_URI: ${{ secrets.PROXY_URI }}
       ZAMPTO_SESSION_SECRET: ${{ secrets.ZAMPTO_SESSION_SECRET }}
       ZAMPTO_USERNAME: ${{ secrets.ZAMPTO_USERNAME }}
