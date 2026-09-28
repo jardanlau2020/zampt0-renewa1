@@ -1,13 +1,15 @@
 name: Zampto 自动续期
 
 on:
-  # ⏸ 2026-09-28 暫停排程 — 站方新增反 VPN/代理偵測：帶 session 的請求一律回
-  #   403 {"error":"Access blocked","reason":"VPN or proxy detected"} 並跳 /blocked
-  #   （實測矩陣見 commit f8d772c：帶 cookie 就封，唔帶 cookie 就正常，代理/直連一樣）。
-  #   即係「人手撳得到、機械人撳唔到」，繼續跑只會每 8 小時一條紅燈。
-  #   要恢復：取消下面註解（或用 workflow_dispatch 手動跑）。
-  # schedule:
-  #   - cron: '0 */8 * * *'  # 每8小时 UTC 00/08/16, 確保過期前有反應時間
+  # ✅ 2026-09-28 復活 — 真因係兩件事疊加：(a) 舊 session cookie 已失效（就算乾淨出口都
+  #   只當未登入 → 307 /auth/login）；(b) 阿里雲機房出口在站方 VPN 黑名單（帶有效 session
+  #   才觸發 403 /blocked，未登入反而正常，所以冇 cookie 探針會誤判成「出口乾淨」）。
+  #   對策：換 RO hysteria2 住宅級出口（77.74.123.98, AS25198）+ 用戶親手貼嘅新 session。
+  #   實測 run #70（36425660554）success：出口探針 PROXY_OK=1、Turnstile 63.8s 自行通過、
+  #   POST /api/server/renew → 200、✅ 續期成功。詳見 commit 訊息同 memory/2026-09-28/。
+  #   若日後紅燈：先睇係出口探針失敗（換節點）定係 session 失效（重新貼 cookie）。
+  schedule:
+    - cron: '0 */8 * * *'  # 每8小时 UTC 00/08/16, 確保過期前有反應時間
   workflow_dispatch:
     inputs:
       force_renew:
