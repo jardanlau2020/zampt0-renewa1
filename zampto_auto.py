@@ -79,6 +79,12 @@ def mask_headers(headers):
     return out
 
 
+def now_local():
+    """UTC+8 當地時間 MM-DD HH:MM（runner 係 UTC）"""
+    from datetime import timedelta
+    return (datetime.now(timezone.utc) + timedelta(hours=8)).strftime("%m-%d %H:%M")
+
+
 def push_tg(title, body):
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
         log.warning("Telegram config missing, skipping send")
@@ -89,7 +95,8 @@ def push_tg(title, body):
         proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
         r = requests.post(
             f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
-            json={"chat_id": TG_CHAT_ID, "text": f"{title}\n\n{body}", "parse_mode": "Markdown"},
+            json={"chat_id": TG_CHAT_ID, "text": f"{title}\n{body}" if body else title,
+                  "parse_mode": "Markdown"},
             timeout=15,
             proxies=proxies,
         )
@@ -1697,7 +1704,7 @@ def _report(report):
     body = "\n".join(lines)
 
     log.info("--- Report ---\n%s", body)
-    push_tg("🖥️ Zampto 服务器报告", body)
+    push_tg(f"🎮 Zampto 伺服器報告 ｜ {now_local()}", body)
     try:
         os.makedirs(LOG_DIR, exist_ok=True)
         with open(os.path.join(LOG_DIR, "report.json"), "w", encoding="utf-8") as f:
@@ -1711,7 +1718,8 @@ def main():
     # Validate env vars
     if not all([USERNAME, PASSWORD, SERVER_ID]):
         log.error("Missing required env vars: USERNAME, PASSWORD, SERVER_ID")
-        push_tg("🚨 Setup Error", "Missing ZAMPTO credentials. Configure GitHub Secrets.")
+        push_tg(f"❌ Zampto 設定錯誤 ｜ {now_local()}",
+                "▪️ 缺少 ZAMPTO 憑據（USERNAME／PASSWORD／SERVER_ID），去 GitHub Secrets 補")
         return
 
     log.info("=== Zampto Auto Renewal v5 ===")
@@ -1734,7 +1742,8 @@ def main():
                 raise ValueError("No cookies found in session secret")
         except Exception as e:
             log.error("Failed to parse ZAMPTO_SESSION_SECRET: %s", e)
-            push_tg("🚨 Session Error", f"Cannot decode ZAMPTO_SESSION_SECRET: {str(e)}")
+            push_tg(f"❌ Zampto session 解碼失敗 ｜ {now_local()}",
+                    f"▪️ ZAMPTO_SESSION_SECRET 解唔開：{str(e)[:120]}")
             cookies = None  # fall through to fail cleanly
 
     # Mode B: Local dev – try saved session file
@@ -1749,7 +1758,7 @@ def main():
     if not cookies:
         log.error("No valid authentication available - cannot proceed")
         reason = "Missing ZAMPTO_SESSION_SECRET (GitHub) OR missing ./screenshots/session.json (local)"
-        push_tg("🚨 Authentication Error", reason)
+        push_tg(f"❌ Zampto 認證失敗 ｜ {now_local()}", f"▪️ {reason[:140]}")
         report = {
             "server_id": SERVER_ID, "status": "unknown", "action": "none",
             "expiry": None, "error": reason,
@@ -1857,12 +1866,9 @@ def main():
     if status == "renewed":
         log.info("✓ 续期成功")
         try:
-            push_tg("🖥️ Zampto 服务器报告",
-                f"**服务器 ID:** `{SERVER_ID}`\n"
-                f"**状态:** 🟢 运行中\n"
-                f"**操作:** 🔄 已续期"
-                + (f"\n**到期:** {expiry_str}" if expiry_str else "") + "\n"
-                f"\n*浏览器自动续期完成*")
+            push_tg(f"🎮 Zampto 續期 ｜ {now_local()} ｜ ✅ 1 ｜ ⏭️ 0 ｜ ❌ 0",
+                f"▪️ {SERVER_ID} · ✅ 已續期"
+                + (f" · 到期 {expiry_str}" if expiry_str else ""))
         except Exception as e:
             log.warning("TG 通知失败(忽略): %s", e)
         # 用 os._exit 替代 sys.exit: sys.exit 触发 SystemExit 异常, 在 Playwright/
@@ -1872,12 +1878,9 @@ def main():
     elif status == "skipped":
         log.info("⏭️ 剩余时间充足, 跳过续期")
         try:
-            push_tg("🖥️ Zampto 服务器报告",
-                f"**服务器 ID:** `{SERVER_ID}`\n"
-                f"**状态:** 🟢 运行中\n"
-                f"**操作:** ⏭️ 已跳过"
-                + (f"\n**到期:** {expiry_str}" if expiry_str else "") + "\n"
-                f"\n*剩余时间充足, 无需续期*")
+            push_tg(f"🎮 Zampto 續期 ｜ {now_local()} ｜ ✅ 0 ｜ ⏭️ 1 ｜ ❌ 0",
+                f"▪️ {SERVER_ID} · ⏭️ 未可續（剩餘時間充足）"
+                + (f" · 到期 {expiry_str}" if expiry_str else ""))
         except Exception as e:
             log.warning("TG 通知失败(忽略): %s", e)
         os._exit(0)
@@ -1892,10 +1895,8 @@ def main():
     # 两种方式都失败
     log.error("❌ 浏览器和 API 续期均失败")
     try:
-        push_tg("🖥️ Zampto 服务器报告",
-            f"**服务器 ID:** `{SERVER_ID}`\n"
-            f"**状态:** 🔴 失败\n"
-            f"**错误:** 浏览器和 API 续期均失败")
+        push_tg(f"🎮 Zampto 續期 ｜ {now_local()} ｜ ✅ 0 ｜ ⏭️ 0 ｜ ❌ 1",
+            f"▪️ {SERVER_ID} · ❌ 瀏覽器同 API 續期都失敗\n⚠️ 睇 workflow log 排查")
     except Exception as e:
         log.warning("TG 通知失败(忽略): %s", e)
     os._exit(1)
