@@ -486,25 +486,42 @@ def group_b() -> None:
     atexit.register(shutil.rmtree, scratch, True)
     os.chdir(scratch)
 
-    def run_main(app, *, browser="failed", api_report=None, secret=None, extra=None):
+    def run_main(app, *, browser="failed", api_report=None, secret=None, extra=None,
+                 page_expiry=None, seen=None):
         """跑一次 main()，返回 (退出码, stdout)。
 
         输出由 run_main 自己捕获后回传，而不是让调用方再套一层
         redirect_stdout —— 嵌套 redirect 会让外层那个永远读到空串。
+
+        page_expiry：模拟「页内读数成功」。给 (iso, hours, human) 时写进
+        _PAGE_STATE，main() 应该直接用它、不再调 _query_expiry。
+        seen：可选 dict，会写入 seen["query_expiry_called"]。
         """
         app.phase_browser_renewal = lambda cookies=None: browser
         if api_report is not None:
             app.phase_api_renewal = lambda use_cookies=None: app._to_renew_report(api_report)
-        app._query_expiry = lambda cookies, wait_for_fresh: (
-            "2026-10-04T12:00:00+00:00", 47, "1d 23h 0min")
+        app._PAGE_STATE["expiry"] = page_expiry
+        if page_expiry is None:
+            app._PAGE_STATE["cookies"] = []
+        calls = {"query_expiry": 0}
+
+        def _fake_query(cookies, wait_for_fresh):
+            calls["query_expiry"] += 1
+            return ("2026-10-04T12:00:00+00:00", 47, "1d 23h 0min")
+
+        app._query_expiry = _fake_query
         env = {"CI": "true", "GITHUB_ACTION": "1",
                "ZAMPTO_SESSION_SECRET": secret if secret is not None else session_secret()}
         if extra:
             env.update(extra)
         with env_patch(**env):
             with stdout() as buf:
-                code = app.main()
-        return code, buf.getvalue()
+                with logs() as lbuf:
+                    code = app.main()
+        # 两路都要：报告走 print，脚本自己的诊断走 log
+        if seen is not None:
+            seen["query_expiry_called"] = calls["query_expiry"]
+        return code, buf.getvalue() + lbuf.getvalue()
 
     # B4 浏览器成功
     with notify_spy() as spy:
@@ -519,6 +536,36 @@ def group_b() -> None:
     eq("B5.1 浏览器 skipped -> exit 0", code, 0)
     eq("B5.2 浏览器 skipped -> 恰好 1 条通知", len(spy.calls), 1)
     check("B5.3 通知说状态良好", "状态良好" in spy.texts, spy.texts[:200])
+
+    # B5b 页内读数优先：有页内到期时间就不该再走 requests 兜底
+    # （run #87 证明 requests 打 /api/servers 恒 401，兜底不可信）
+    seen = {}
+    with notify_spy() as spy:
+        code, out = run_main(app, browser="renewed",
+                             page_expiry=("2026-10-04T12:00:00+00:00", 47, "1d 23h 0min"),
+                             seen=seen)
+    eq("B5b.1 页内读数 -> exit 0", code, 0)
+    eq("B5b.2 有页内读数时不调 _query_expiry", seen["query_expiry_called"], 0)
+    check("B5b.3 日志说明到期取自页内读数", "到期时间取自页内读数" in out, out[-300:])
+    eq("B5b.4 页内读数路径仍恰好 1 条通知", len(spy.calls), 1)
+
+    # B5c 没有页内读数时才回落 requests
+    seen2 = {}
+    with notify_spy():
+        code, out2 = run_main(app, browser="renewed", page_expiry=None, seen=seen2)
+    eq("B5c.1 无页内读数 -> exit 0", code, 0)
+    eq("B5c.2 无页内读数时调了 _query_expiry", seen2["query_expiry_called"], 1)
+    check("B5c.3 日志说明退回 requests 查询", "退回 requests 查询" in out2, out2[-300:])
+
+    # B5d 页内读数也算「跳过」的到期时间
+    seen3 = {}
+    with notify_spy() as spy:
+        code, out3 = run_main(app, browser="skipped",
+                              page_expiry=("2026-11-01T00:00:00+00:00", 720, "30d 0h"),
+                              seen=seen3)
+    eq("B5d.1 skipped + 页内读数 -> exit 0", code, 0)
+    eq("B5d.2 skipped 时也不调 _query_expiry", seen3["query_expiry_called"], 0)
+    check("B5d.3 skipped 通知仍说状态良好", "状态良好" in spy.texts, spy.texts[:200])
 
     # B6 浏览器失败 -> API 成功
     with notify_spy() as spy:
@@ -660,6 +707,20 @@ def group_c() -> None:
     check("C29h 页内探测三个候选端点",
           '"/api/servers",' in APP_SRC and 'f"/api/servers/{SERVER_ID}",' in APP_SRC)
     check("C29i 诊断打印 [API 观察]", "[API 观察]" in APP_SRC)
+    # run #87 页内探测给出答案：/api/servers 在页面里 200 且带 renewal，
+    # 我们 requests 侧 401 —— 差别在 cookie 集合（页面加载后才有 XSRF-TOKEN）。
+    # 所以页内读数升为主路径，requests 降为兜底。
+    check("C29j 有 _PAGE_STATE 容器",
+          '_PAGE_STATE: dict = {"cookies": [], "expiry": None}' in APP_SRC)
+    check("C29k 有 read_renewal_in_page", "def read_renewal_in_page(page, server_id)" in CODE)
+    check("C29l 页内闸门能返回 skipped",
+          '[页内读数] 剩余 %dh' in APP_SRC and 'return "skipped"' in APP_SRC)
+    check("C29m main 优先用页内读数算到期",
+          'expire_at, hours, human = _PAGE_STATE["expiry"]' in APP_SRC)
+    check("C29n 续期后在页内重试取新 renewal",
+          "[页内读数] 尝试 %d: renewal=%s (age=%.0fs)" in APP_SRC)
+    check("C29o requests 查询降级为兜底（传浏览器 cookie）",
+          '_query_expiry(\n                _PAGE_STATE["cookies"] or cookies,' in APP_SRC)
 
     # ---- workflow
     check("C30 workflow 引用 renew-kit composite action",

@@ -83,6 +83,19 @@ DASHBOARD_URL = "https://dash.zampto.net"
 SESSION_FILE = "./screenshots/session.json"
 LOG_DIR = "./screenshots"
 
+# 浏览器上下文里读到的「权威」结果：最新 cookie 集合 + 到期时间。
+#
+# 为什么需要：run #87 的页内探测证明 `GET /api/servers` 在页面上下文里回
+# 200 且带着完整 renewal，但我们手写的 requests 一律 401 —— 差别在 cookie
+# 集合。ZAMPTO_SESSION_SECRET 里只有 1 个 cookie（zampto_session），
+# XSRF-TOKEN 是页面加载后才由服务端下发的，secret 里没有它，而 API 守卫要。
+#
+# 浏览器已经把它拿到手了，所以：
+#   · cookies —— 借给 requests 侧复用（比在 requests 侧硬凑请求头可靠）；
+#   · expiry  —— 页内直接读出来的到期时间，比 requests 兜底可信。
+# requests 路径降级为「浏览器不可用时的兜底」，不再当主路径。
+_PAGE_STATE: dict = {"cookies": [], "expiry": None}
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s")
 log = logging.getLogger("zampto")
 
@@ -1007,6 +1020,45 @@ def probe_api_in_page(page, paths):
                     r.get("path"), r.get("status"), (r.get("body") or "")[:200])
 
 
+def read_renewal_in_page(page, server_id):
+    """在页面上下文里读目标服务器的 renewal（页面已鉴权，必然成功）。
+
+    返回 (renewal 原始字符串 or None, 全部服务器 id 列表)。
+    读不到时把原因写进日志 —— 这条路径不该静默失败。
+    """
+    js = """
+    async () => {
+      try {
+        const r = await fetch('/api/servers', {credentials: 'include',
+          headers: {'Accept': 'application/json', 'X-Requested-With': 'XMLHttpRequest'}});
+        if (!r.ok) return {__status: r.status, __body: (await r.text()).slice(0, 200)};
+        return await r.json();
+      } catch (e) {
+        return {__error: String(e).slice(0, 200)};
+      }
+    }
+    """
+    try:
+        data = page.evaluate(js)
+    except Exception as e:
+        log.warning("  [页内读数] 执行失败: %s", e)
+        return None, []
+    if not isinstance(data, dict):
+        log.warning("  [页内读数] 返回的不是对象: %s", str(data)[:150])
+        return None, []
+    if "__status" in data or "__error" in data:
+        log.warning("  [页内读数] /api/servers 没拿到数据: %s", str(data)[:200])
+        return None, []
+    servers = [s for s in (data.get("servers") or []) if isinstance(s, dict)]
+    ids = [s.get("id") for s in servers]
+    for s in servers:
+        if str(s.get("id")) == str(server_id):
+            return (s.get("renewal") or None), ids
+    log.warning("  [页内读数] 没有 id=%s 的服务器；现有 id=%s",
+                _mask_id(server_id), [_mask_id(i) for i in ids])
+    return None, ids
+
+
 def phase_browser_renewal(cookies=None):
     """Phase 2: 浏览器自动续期。
     返回: "renewed" / "skipped" / "failed" """
@@ -1177,6 +1229,17 @@ def phase_browser_renewal(cookies=None):
         snap(page, "03_server_page.png")
         log.info("服务器页加载完成, URL: %s", page.url)
 
+        def _snapshot_cookies(tag):
+            """把浏览器当前的 cookie 集合留给 requests 侧复用（含 XSRF-TOKEN）。"""
+            try:
+                jar = ctx.cookies()
+                _PAGE_STATE["cookies"] = jar
+                log.info("  [COOKIE] 快照(%s): %s", tag, [c.get("name") for c in jar])
+            except Exception as e:
+                log.warning("  [COOKIE] 快照失败(%s): %s", tag, e)
+
+        _snapshot_cookies("导航后")
+
         # 以页面为准：先看页面自己打了哪些 API，再在页内试打候选端点。
         # 手写的 requests 打 /api/servers 一直 401，但页面的请求是通的 ——
         # 在页面上下文里发同一个请求，就能区分「端点不对」（页内也 401）
@@ -1190,6 +1253,25 @@ def phase_browser_renewal(cookies=None):
             f"/api/server?id={SERVER_ID}",
             f"/api/servers/{SERVER_ID}",
         ])
+
+        # ── 页内闸门（run #87 之后的正确做法）
+        # 启动浏览器之前那次 precheck 用的是 requests + secret 里的旧 cookie，
+        # 必然 401，所以「剩余时间够就跳过」这条闸门一直没生效，每 8 小时
+        # 都真续一次。页面上下文已经鉴权，这里是唯一可靠的到期时间来源，
+        # 因此闸门放在这里。
+        raw_in_page, _ids = read_renewal_in_page(page, SERVER_ID)
+        if raw_in_page:
+            exp_iso, exp_h = renewal_to_expiry(raw_in_page)
+            if exp_iso:
+                human = _fmt_remaining(exp_iso)
+                _PAGE_STATE["expiry"] = (exp_iso, exp_h, human)
+                log.info("  [页内读数] renewal=%s -> 到期 %s（%s）", raw_in_page, exp_iso, human)
+                if not FORCE_RENEW and exp_h is not None and exp_h > RENEW_THRESHOLD_HOURS:
+                    log.info("  [页内读数] 剩余 %dh (>%dh), 跳过续期",
+                             exp_h, RENEW_THRESHOLD_HOURS)
+                    _snapshot_cookies("跳过续期")
+                    browser.close()
+                    return "skipped"
 
         # 执行续期
         # 服务端要求 server_id 为整数: 传字符串 "15629" 会直接回 400 "Invalid server ID"
@@ -1212,6 +1294,29 @@ def phase_browser_renewal(cookies=None):
         renewed, data = renew_via_browser_fetch(page, sid, explicit_csrf=browser_csrf_token)
         if renewed:
             log.info("续期成功! response: %s", data.get("body", "")[:200])
+            _snapshot_cookies("续期后")
+            # 续期后服务端更新 renewal 有几秒延迟，页内重试几次；要求拿到
+            # 「刚发生」的值（age 小），否则继续等 —— 与 _query_expiry 的
+            # wait_for_fresh 语义一致，只是换成在页面里读。
+            for _try in range(3):
+                raw_after, _ids2 = read_renewal_in_page(page, SERVER_ID)
+                if raw_after:
+                    exp_iso2, exp_h2 = renewal_to_expiry(raw_after)
+                    if exp_iso2:
+                        try:
+                            age2 = (datetime.now(timezone.utc)
+                                    - datetime.fromisoformat(raw_after.replace("Z", "+00:00"))
+                                    ).total_seconds()
+                        except Exception:
+                            age2 = 0.0
+                        log.info("  [页内读数] 尝试 %d: renewal=%s (age=%.0fs)",
+                                 _try + 1, raw_after, age2)
+                        if age2 <= 60 or _try == 2:
+                            _PAGE_STATE["expiry"] = (exp_iso2, exp_h2, _fmt_remaining(exp_iso2))
+                            log.info("  [页内读数] 续期后到期时间: %s（%s）",
+                                     exp_iso2, _PAGE_STATE["expiry"][2])
+                            break
+                page.wait_for_timeout(3000)
             browser.close()
             return "renewed"
 
@@ -2087,8 +2192,16 @@ def main() -> int:
             log.info("✓ 续期成功")
         else:
             log.info("⏭️ 剩余时间充足, 跳过续期")
-        expire_at, hours, human = _query_expiry(
-            cookies, wait_for_fresh=(status == "renewed"))
+        # 页内读数优先：页面已鉴权，必然读得到 renewal；requests 只作兜底 ——
+        # secret 里的 cookie 集合没有 XSRF-TOKEN，打 /api/servers 会 401。
+        if _PAGE_STATE["expiry"]:
+            expire_at, hours, human = _PAGE_STATE["expiry"]
+            log.info("到期时间取自页内读数: %s（%s）", expire_at, human)
+        else:
+            log.info("页内没读到到期时间，退回 requests 查询（大概率 401）")
+            expire_at, hours, human = _query_expiry(
+                _PAGE_STATE["cookies"] or cookies,
+                wait_for_fresh=(status == "renewed"))
         return _finish(_new_report(
             action=status, status="running",
             expire_at=expire_at, hours_left=hours, expiry=human))
