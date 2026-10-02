@@ -1,165 +1,209 @@
 # Zampto 自动续期 ⚡
 
-通过 GitHub Actions 每日自动检查并续期你的 Zampto Minecraft 服务器。https://zampto.net/
+Zampto Minecraft 面板的自动续期：每 8 小时检查一次，剩余时间不足阈值就续，
+结果推 Telegram。https://zampto.net/
 
-**功能特性：**
-- 每日 UTC 00:00（北京时间 08:00）自动检查
-- 服务器停止时自动启动
-- 到期时间不足 48 小时自动续期（可配置）
-- 完成或失败时通过 Telegram Bot 推送通知
-- 两阶段认证机制，绕过 Cloudflare Turnstile 验证
-- 支持**多格式代理节点**（hysteria2 / hy2 / tuic / vless / vmess，自动解析），解决 GitHub Actions IP 被封问题
-- **续期结果验证**：点击续期后重新查询到期时间，未变化则报失败（不再"假成功"）
+> **2026-10-02 已迁移到 [renew-kit](../../renew-kit)**（composite action `@v0.5.3`）。
+> 通知排版、结果分类、退出码、演练开关全部归 kit，本仓库只留业务逻辑。
 
 ---
 
-## 🚀 配置指南
+## 每轮做什么
 
-### 阶段一：首次登录（本地，一次性操作）
-
-在你的**本地机器**上运行一次，完成 Zampto 身份验证：
-
-```bash
-python zampto_auto.py
+```
+1. 准备出口      scripts/setup_proxy.sh：起 sing-box，探针验出口是否被 Zampto 标记
+                 被标记就换下一个候选，最后才考虑直连；都不行则中止
+2. 注入会话      ZAMPTO_SESSION_SECRET（session.json 的 base64）解出 cookies
+3. 浏览器续期    Playwright 打开面板 → 必要时过 Turnstile → 点 Renew
+                 由页面 JS 发请求，自动携带正确的 CSRF
+4. 兜底 API 路径 浏览器没成时，用 requests 直接打 /api/server/renew
+                 （CSRF 三种编码形态 × 两种 header 逐一试）
+5. 复核到期时间   重新查 renewal 字段，算「上次续期 + 48h」
+6. 出报告        classify() -> Outcome -> RenewReport.finish()（打印 + 发 TG + 退出码）
 ```
 
-会自动打开一个浏览器窗口，请按正常流程完成登录（包括可能出现的 Turnstile 验证码）。登录成功后，脚本会将认证信息保存到 `./screenshots/session.json`。
-
-> 💡 该 session 文件包含你的登录 Cookie，切勿公开分享。
+**Zampto 的 `renewal` 字段是「上次续期时间」，不是到期时间** —— 到期 = renewal + 48h。
+直接拿它当到期时间会渲染出一个已经过去的日期，这是这个面板最容易踩的字段语义坑，
+现在集中收在 `renewal_to_expiry()` 里算一次。
 
 ---
 
-### 阶段二：配置 GitHub Secrets
+## 结果分类
 
-在你的 GitHub 仓库（**weikkadd/zampto**）中：
+`classify()` 是唯一裁决口，优先级：**显式 transient 标记 > 出口被风控 > 业务动作 > 错误文本特征**。
 
-1. 进入 **Settings → Secrets and variables → Actions**
-2. 点击 **New secret**，依次添加以下变量：
+| Outcome | 触发条件 | 渲染 | 退出码 |
+|---|---|---|---|
+| `renewed` | 续期成功 | ✅ 成功续期至 … | 0 |
+| `skipped` | 未到窗口且无错误 | 🟢 状态良好（剩 N 天） | 0 |
+| `transient` | 上游 5xx / 超时 / 连不上 | 🌐 上游暂不可用 | **0（不标红）** |
+| `failed` | 验证码挡路 / CSRF 打不通 / 出口被标记 | 🚨 续期未完成 | 1 |
 
-| Secret 名称 | 说明 | 示例值 |
-|-------------|------|--------|
-| `ZAMPTO_USERNAME` | Zampto 账户邮箱 | `user@example.com` |
-| `ZAMPTO_PASSWORD` | Zampto 账户密码 | `********` |
-| `ZAMPTO_SERVER_ID` | 服务器 ID（例如 6578） | `6578` |
-| `TG_BOT_TOKEN` | 来自 @BotFather 的 Bot Token | `123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11` |
-| `TG_CHAT_ID` | 来自 @userbotbot 的 Chat ID | `123456789` |
-| `ZAMPTO_SESSION_SECRET` | session.json 的 base64 编码字符串 | `{base64 编码后的 session.json 内容}` |
-| `PROXY_URI`（可选，推荐） | 代理节点链接（多格式），绕过 IP 封锁 | `hysteria2://密码@host:port?sni=xxx&insecure=1` |
+三条容易搞错的地方：
 
-> `PROXY_URI` 优先；旧名称 `TUIC_URI` 仍兼容（自动兜底），二选一即可。
+- **上游故障不标红。** 502/503/504/520-524、timeout、connection reset → `transient`，
+  退出码 0，等下次排程。旧版一律算失败，于是面板抖一下 job 就红一次。
+- **出口被风控要标红。** `403 {"error":"Access blocked","reason":"VPN or proxy detected"}`
+  不是上游故障，是**要换节点**，属于人工处理 → `failed`。
+- **验证码挡路要标红。** 续期没发生就该让 workflow 报 failure —— 静默 green 会让人
+  以为还在自动续期，实际服务器已经到期了。
 
-生成 `ZAMPTO_SESSION_SECRET` 的方法：
+---
+
+## 配置
+
+### Secrets（Settings → Secrets and variables → Actions）
+
+| 名称 | 必填 | 说明 |
+|---|---|---|
+| `ZAMPTO_SESSION_SECRET` | ✅ | `screenshots/session.json` 的 **base64 全文**，见下方生成方法 |
+| `ZAMPTO_USERNAME` | ✅ | 账户邮箱（仅本地交互登录用，CI 路径不读） |
+| `ZAMPTO_PASSWORD` | ✅ | 账户密码（同上） |
+| `ZAMPTO_SERVER_ID` | ✅ | 服务器 ID，如 `15629` |
+| `PROXY_URI` | ✅ | 代理节点链接，多格式自动解析，见下 |
+| `TUIC_URI` | ➖ | `PROXY_URI` 的兜底候选；两个都配时先试 `PROXY_URI` |
+| `TG_BOT_TOKEN` | ➖ | 不配则只打日志，不推送 |
+| `TG_CHAT_ID` | ➖ | 同上 |
+
+`.github/secrets_chunks.json` 已删除 —— git 里不再有任何凭据。
+
+> 旧注释说「REST API PUT /actions/secrets 有 7 字符硬上限」已被证伪：
+> 用 PyNaCl **SealedBox**（libsodium sealed box）加密后 PUT 完全正常，182 字的
+> `PROXY_URI` 就是那么写进去的。之前 422 的原因是用错 `Box` 而非 `SealedBox`。
+
+### 变量（workflow_dispatch 输入）
+
+| 输入 | 默认 | 说明 |
+|---|---|---|
+| `force_renew` | `false` | 无视剩余时间强制续期 |
+| `enable_recording` | `false` | 录屏排障，产物只留 3 天 |
+| `dry_run` | `false` | **演练**：照跑一遍，跳过 Telegram 通知，消息原文打进日志 |
+
+`dry_run` 的闸门在 `renewkit.notify.send()` 里（v0.5.2 起）—— 所以它对
+`RenewReport.finish()` 也生效，且一个字节都不会发出去。workflow 把它映射成
+环境变量 `DRY_RUN=1`（不勾选时是空串，空串 = 关）。
+
+### 生成 `ZAMPTO_SESSION_SECRET`
+
 ```python
 import json, base64
 with open("./screenshots/session.json") as f:
-    session = json.load(f)
-encoded = base64.b64encode(json.dumps(session).encode()).decode()
-print(encoded)  # 复制这段内容到 Secret 中
+    print(base64.b64encode(json.dumps(json.load(f)).encode()).decode())
 ```
 
----
+`scripts/phase1_setup.bat`（Windows）把这一整套本地登录流程包成了一次双击：
+建 venv → 装依赖 → 打开浏览器人工登录 → 打印 base64。
 
-### 阶段二（扩展）：配置代理节点
+### 代理节点
 
-> ⚠️ **如果你在 GitHub Actions 运行时遇到 `403 Access blocked, VPN or proxy detected` 错误**，说明 GitHub 的 IP 被 Zampto 拉黑了，必须配置代理绕过。
+`PROXY_URI` 支持五种前缀，workflow 自动识别：
 
-#### 1. 支持的节点格式
+| 协议 | 示例 |
+|---|---|
+| hysteria2（推荐） | `hysteria2://密码@host:port?sni=example.com&insecure=1` |
+| hy2 | `hy2://密码@host:port?sni=example.com&insecure=1` |
+| tuic | `tuic://UUID:密码@host:port?sni=example.com&insecure=0&alpn=h3` |
+| vless | `vless://UUID@host:port?security=tls&sni=example.com` |
+| vmess | `vmess://base64的JSON…` |
 
-Workflow 自动识别以下前缀（`PROXY_URI` Secret）：
+**为什么要代理**：Zampto 于 2026-09-26 上线反 VPN/代理侦测，被标记的出口 IP 对所有
+`/api/*` 回 403 `Access blocked`。GitHub runner 的裸出口就在名单里。
 
-| 协议 | 链接格式示例 |
-|------|-------------|
-| **hysteria2**（推荐） | `hysteria2://密码@host:port?sni=example.com&insecure=1` |
-| **hy2**（hysteria2 别名） | `hy2://密码@host:port?sni=example.com&insecure=1` |
-| **tuic** | `tuic://UUID:密码@host:port?sni=example.com&insecure=0&alpn=h3` |
-| **vless** | `vless://UUID@host:port?security=tls&sni=example.com` |
-| **vmess** | `vmess://base64的JSON...` |
-
-在 v2rayN / NekoBox / Clash Verge 等客户端中，右键节点 → **分享 / 复制链接** 即可得到上述格式。
-
-#### 2. 添加到 GitHub Secret
-
-1. 打开 **Settings → Secrets and variables → Actions**
-2. 点击 **New secret**
-3. **Name:** `PROXY_URI`（旧名 `TUIC_URI` 也兼容）
-4. **Value:** 粘贴完整的节点链接（包含 `?` 后所有参数）
-5. 点击 **Add secret**
-
-#### 3. URI 参数说明
-
-| 参数 | 必填 | 说明 |
-|------|------|------|
-| `sni` | ❌ | TLS SNI，缺省时使用 host |
-| `insecure` / `allowInsecure` | ❌ | 是否禁用证书校验，`1`=禁用（自签证书用），`0`=校验，缺省不校验 |
-| `alpn` | ❌ | ALPN 协议（tuic 常用 `h3`） |
-
-#### 4. 工作机制
-
-Workflow 会自动：
-1. 用 Python 解析节点链接（多格式识别）
-2. 下载 `sing-box`（支持 hysteria2 / tuic / vless / vmess）
-3. 按协议生成对应 outbound 配置，启动监听 `127.0.0.1:1080` SOCKS5
-4. 设置 `ALL_PROXY=socks5h://127.0.0.1:1080` 给后续步骤
-5. Python 脚本自动读取 `ALL_PROXY`，所有 requests 请求（API 调用 + Telegram 推送）走代理
-6. **代理不可用（节点失效 / 未配置）时直接报错退出**，不再裸 IP 直连（必被 Cloudflare 403）
-
----
-
-### 阶段三：验证工作流
-
-工作流会在每天 UTC 00:00 自动触发。你也可以通过 **Actions → Run workflow** 手动触发一次进行验证。
-
----
-
-## 🔒 安全提示
-
-- 切勿将 `session.json` 提交到 Git 仓库（已在 `.gitignore` 中排除）
-- 推送代码时建议使用专门的 GitHub Personal Access Token（Classic 类型，仅需 repo 权限）
-- 妥善保管 `ZAMPTO_SESSION_SECRET`——它等同于你服务器的登录凭证
-
----
-
-## 🐍 依赖说明
+**探针怎么判断**（未登录即可区分两种 403）：
 
 ```
-cloakbrowser[geoip]   # 仅阶段一（本地浏览器登录）需要
-requests               # 用于纯 API 续期
+干净出口 → {"success":false,"message":"Unauthorized"}  + 页面 307 → /auth/login
+被标记   → "...Access blocked..."                       + 页面 307 → /blocked
 ```
 
-GitHub Actions 会通过 `requirements.txt` 自动安装以上依赖。
+`scripts/setup_proxy.sh` 按 `PROXY_URI` → `TUIC_URI` 顺序逐个试，探针不过就换下一个，
+全都不行才考虑直连；直连也不行就 `exit 1`（续期必失败，早死早超生，别白跑 20 分钟）。
+
+> 节点 URI 本身（含凭据）**任何情况下都不打印**，只打印出口 IP。
 
 ---
 
-## 🛠 常见问题排查
+## 怎么跑
 
-- **完成阶段一后仍然登录失败？** 删除旧的 session 文件，重新执行阶段一。
-- **API 返回 403 / 401？** Session 可能已过期，重新执行阶段一获取新的 session，并更新 `ZAMPTO_SESSION_SECRET`。
-- **出现 "Server not found" 错误？** 请检查 `ZAMPTO_SERVER_ID` 是否正确。
-- **API 返回 `403 Access blocked, VPN or proxy detected`？** GitHub IP 被 Zampto 拉黑，请配置 `PROXY_URI` Secret（参考阶段二扩展章节）。
-- **代理启动失败（`[ERROR] Proxy is DOWN`）？** 节点可能已失效，换一个可用节点更新 `PROXY_URI`；Workflow 日志会打印 sing-box 日志帮助排查。
-- **续期显示失败（renewal 未变化）？** 说明点击续期后到期时间未更新（可能被 Cloudflare 拦截或按钮未生效），此时 Actions 会标记失败，方便你及时发现，而不是之前的"假成功"。
-- **Telegram 推送失败但 API 成功？** 同样是 IP 问题，配置 `PROXY_URI` 后 Telegram 推送也会自动走代理。
+workflow 每 8 小时跑一次（UTC 00/08/16），也可以在 Actions → Run workflow 手动触发。
+本地跑：
+
+```bash
+pip install -r requirements.txt
+python -m playwright install chromium
+
+# 阶段一：本地交互登录，产出 ./screenshots/session.json
+python zampto_auto.py
+```
+
+本地跑不设 `CI`，脚本会走 `load_session()` 读 `./screenshots/session.json`。
 
 ---
 
-## 📖 架构说明
+## 离线验证
 
-```
-阶段一（本地，一次性）：
-  浏览器 → 登录页面 → 手动通过 Turnstile → 保存 session.json
-
-阶段二（GitHub Actions，每日执行）：
-  +-------------+    +----------------+    +----------------------+
-  | PROXY_URI  | -> | sing-box       | -> | SOCKS5 127.0.0.1:1080|
-  |(多格式节点) |    | (hys2/tuic/..) |    +----------------------+
-  +-------------+    +----------------+             |
-                                                   ↓
-  ZAMPTO_SESSION_SECRET (base64) -> requests.Session (proxy)
-  ↓
-  /api/servers          → 检查服务器状态 & 到期时间
-  POST /api/server/renew → 若到期时间 < 48 小时（点击后验证 renewal 是否更新）
-  Telegram Bot → 推送执行报告（也走代理）
+```bash
+python .verify/verify_zampto.py
 ```
 
-阶段二完全跳过登录页面，直接复用 Cookie 调用 API，从而彻底规避 Cloudflare Turnstile 问题。
-配置 `PROXY_URI` 后，所有请求走代理，绕过 GitHub IP 封锁。
+不需要浏览器、不需要网络、不需要任何 secret。四组：
+
+| 组 | 覆盖 |
+|---|---|
+| `[A]` | 纯函数：`renewal_to_expiry` / `_fmt_remaining` / `_new_report` / `find_csrf_cookie` / `mask_headers` / `_human_summary` |
+| `[B]` | 场景矩阵：`classify()` 18 种组合 + `main()` 各 outcome 下的退出码与**通知条数** |
+| `[C]` | 静态接线：迁移不变量、workflow 钉的版本、scripts 的不变量、README/`.gitignore` |
+| `[D]` | 真子进程：`py_compile` / `import` / `main()` 退出码 / `bash -n` / YAML 解析 |
+
+`[B]` 里有一条专门钉「**失败只发一条通知**」——旧版 `phase_api_renewal()` 失败时自己
+推一条 🚨，`main()` 拿到 False 之后又推一条，一次失败收两条告警。
+
+---
+
+## 迁移到 renew-kit 时改了什么
+
+1. **配置读取收口到 `renewkit.env`**；`TG_BOT_TOKEN`/`TG_CHAT_ID` 的模块级全局、
+   `push_tg()`、`now_local()` 全部删除。
+   顺带修掉一个真 bug：`push_tg()` 里手搓的 `requests.post` 会跟随 `ALL_PROXY`，
+   而 `renewkit.notify` 用 urllib 直连 —— **TG 走代理本来就不必要**（代理是给面板用的），
+   而且代理一挂连告警都发不出去。
+2. **结果分类收口到 `Outcome`。** 旧版有三套并存的判定：`_report()` 里按 action 字符串
+   分支、`phase_api_renewal()` 末尾再判一次 `_action in ("renewed","skipped")`、
+   `main()` 里又按 status 字符串走一遍 —— 同一件事三个口径。
+3. **修掉「失败会收到两条告警」**（见上）。
+4. **上游 5xx / 连不上 / 超时 → `transient`（不标红）**，旧版一律算失败。
+5. **`os._exit()` 保留。** `sys.exit` 抛 `SystemExit`，在 Playwright 的事件循环里
+   可能被改写成非 0 退出码（续期明明成功、job 却标红），所以退出码现在由 `Outcome`
+   算出来、仍然用 `os._exit` 落地。
+
+同时删掉了 `.github/workflows/api-key-test.yml` —— 它读的是早已删除的
+`.github/secrets_chunks.json`，跑起来只会报文件不存在。
+
+---
+
+## 排障
+
+- **红灯先看是哪一类**：日志里 `🔑 使用 Cookie 注入认证` 那行下面如果是
+  `Access blocked` → 换节点；如果是 `307 /auth/login` → session 失效，重贴 cookie。
+- **`[ERROR] 代理候选与直连都被 Zampto 标记/不可用`** → 换一条非 WARP/VPN 段的节点
+  写进 `PROXY_URI`，或人手去面板续期。
+- **`续期未完成（剩 N 天）` + `Captcha required`** → Turnstile 没自动过。脚本在 CI 里
+  有 90 秒等待窗口；超时就报 failure 让你去面板点一下，而不是假装成功。
+- **`API 续期未真正完成`** → 点了 Renew 但 renewal 字段没变，脚本会重新查询确认，
+  所以不会出现「假成功」。
+- **Telegram 收不到** → 先确认 `TG_BOT_TOKEN`/`TG_CHAT_ID` 都配了；没配只打日志。
+  TG 是直连的，跟代理没关系。
+
+<details>
+<summary>历史：为什么用「两阶段认证」（点开）</summary>
+
+阶段一在本地跑一次，人工过 Turnstile，把 cookies 存成 `session.json`；
+阶段二在 CI 里直接复用 cookie 打 API，完全跳过登录页，从而绕开 Cloudflare Turnstile。
+
+历史上还试过 `cloakbrowser[geoip]` 顶替浏览器，但它的上游 binary v146 在
+ubuntu-24.04 runner 上 `ensure_binary` 一跑就 segfault（exit 139），
+2026-09-16 起改用 Playwright chromium，`launch()` 保持 API 兼容位。
+
+`requirements.txt` 现在是 `playwright` / `requests` / `PySocks`。
+
+</details>

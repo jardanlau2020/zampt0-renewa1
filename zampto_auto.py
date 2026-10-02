@@ -12,15 +12,45 @@ Phase 2 (GitHub Actions):
   - Skip browser entirely, call /api/server/ status & renewal APIs directly
 
 This bypasses Cloudflare Turnstile completely after the initial manual setup.
+
+--------------------------------------------------------------------------
+迁移到 renew-kit（2026-10-02）
+--------------------------------------------------------------------------
+1. 配置读取收口到 renewkit.env；`TG_BOT_TOKEN` / `TG_CHAT_ID` 的模块级全局、
+   `push_tg()`、`now_local()` 全部删除 —— 通知与时间格式都归 renewkit。
+   顺带修掉一个真 bug：`push_tg()` 里手搓的 requests.post 会跟随 ALL_PROXY，
+   而 renewkit.notify 用 urllib 直连；TG 走代理本来就不必要（代理是给面板用的）。
+
+2. 结果分类收口到 Outcome。旧版有三套并存的判定：`_report()` 里按 action 字符串
+   分支、`phase_api_renewal()` 末尾再判一次 `_action in ("renewed","skipped")`、
+   `main()` 里又按 status 字符串走一遍 —— 同一件事三个口径。
+   现在统一：内部 report 字典 -> classify() -> Outcome -> RenewReport。
+
+3. 修掉「失败会收到两条告警」：`phase_api_renewal()` 失败时自己 `_report()` 推了
+   一条 🚨，`main()` 拿到 False 之后又推一条 🚨。现在只构造一个 RenewReport，
+   只发一条。
+
+4. 上游 5xx / 连不上 / 超时 -> TRANSIENT（不标红）。旧版一律算失败。
+   注意 403 "VPN or proxy detected" 仍然算 FAILED —— 那是出口节点要换，
+   属于「要人处理」而不是「等下次排程」。
+
+5. `os._exit()` 保留。sys.exit 抛 SystemExit，在 Playwright 的事件循环里
+   可能被改写成非 0 退出码（续期明明成功、job 却标红，见文件末尾原注释），
+   所以退出码现在由 Outcome 算出来、仍然用 os._exit 落地。
+--------------------------------------------------------------------------
 """
 
-import os, re, sys, json, time, logging, base64, tempfile
-from datetime import datetime, timezone
+import os, re, json, time, logging, base64
+from datetime import datetime, timezone, timedelta
 try:
     import requests
 except ImportError:
     print("requests not installed. Install: pip install requests")
     raise
+
+from renewkit import env, notify, timeutil
+from renewkit.outcome import Outcome
+from renewkit.report import RenewReport, shorten
 
 # 2026-09-16: cloakbrowser 上游 binary v146 在 ubuntu-24.04 runner segfault(exit 139,
 # ensure_binary 一跑就炸), 改用 playwright chromium shim 頂替 launch()。
@@ -41,14 +71,14 @@ def launch(headless=True, proxy=None):
     return _PW.chromium.launch(**kw)
 HAS_CLOAKBROWSER = True
 
-USERNAME = os.getenv("ZAMPTO_USERNAME", "")
-PASSWORD = os.getenv("ZAMPTO_PASSWORD", "")
-SERVER_ID = os.getenv("ZAMPTO_SERVER_ID", "")
-TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "")
-TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
-FORCE_RENEW = os.getenv("FORCE_RENEW", "false").lower() == "true"
+SERVICE = "Zampto"
+
+USERNAME = env.get("ZAMPTO_USERNAME")
+PASSWORD = env.get("ZAMPTO_PASSWORD")
+SERVER_ID = env.get("ZAMPTO_SERVER_ID")
+FORCE_RENEW = env.get("FORCE_RENEW").lower() == "true"
 # 续期阈值 (小时): 剩余时间低于此值才续期, 与续期 API 判断保持一致
-RENEW_THRESHOLD_HOURS = int(os.getenv("RENEW_THRESHOLD_HOURS", "48"))
+RENEW_THRESHOLD_HOURS = env.get_int("RENEW_THRESHOLD_HOURS", 48)
 DASHBOARD_URL = "https://dash.zampto.net"
 SESSION_FILE = "./screenshots/session.json"
 LOG_DIR = "./screenshots"
@@ -77,32 +107,6 @@ def mask_headers(headers):
         else:
             out[k] = v
     return out
-
-
-def now_local():
-    """UTC+8 當地時間 MM-DD HH:MM（runner 係 UTC）"""
-    from datetime import timedelta
-    return (datetime.now(timezone.utc) + timedelta(hours=8)).strftime("%m-%d %H:%M")
-
-
-def push_tg(title, body):
-    if not TG_BOT_TOKEN or not TG_CHAT_ID:
-        log.warning("Telegram config missing, skipping send")
-        return
-    try:
-        # Pick up proxy from env (same as API session)
-        proxy_url = os.getenv("ALL_PROXY") or os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY")
-        proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
-        r = requests.post(
-            f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
-            json={"chat_id": TG_CHAT_ID, "text": f"{title}\n{body}" if body else title},
-            timeout=15,
-            proxies=proxies,
-        )
-        r.raise_for_status()
-        log.info("Telegram sent OK")
-    except Exception as e:
-        log.error("Telegram failed: %s", e)
 
 
 def snap(page, name):
@@ -292,7 +296,7 @@ def get_api_session():
         "X-Requested-With": "XMLHttpRequest",
     })
     # Auto-pick up proxy from env (set by workflow when TUIC is active)
-    proxy_url = os.getenv("ALL_PROXY") or os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY")
+    proxy_url = env.get("ALL_PROXY") or env.get("HTTPS_PROXY") or env.get("HTTP_PROXY")
     if proxy_url:
         s.proxies.update({
             "http": proxy_url,
@@ -698,7 +702,7 @@ def phase_browser_login_interactive():
         raise RuntimeError("CloakBrowser not available - cannot run browser login")
 
     proxy = None
-    if os.getenv("HY2_CONFIG", ""):
+    if env.get("HY2_CONFIG"):
         proxy = {"server": "socks5://127.0.0.1:1080"}
 
     browser = launch(headless=False, proxy=proxy)  # headless=False for visible UI
@@ -1001,11 +1005,11 @@ def phase_browser_renewal(cookies=None):
 
     log.info("Launching CloakBrowser headless...")
     proxy = None
-    if os.environ.get("ALL_PROXY") or os.environ.get("HTTPS_PROXY"):
+    if env.get("ALL_PROXY") or env.get("HTTPS_PROXY"):
         proxy = {"server": "socks5://127.0.0.1:1080"}
 
     try:
-        browser = launch(headless=os.getenv("ZAMPTO_HEADLESS", "false").lower() == "true", proxy=proxy)
+        browser = launch(headless=env.get("ZAMPTO_HEADLESS").lower() == "true", proxy=proxy)
         ctx = browser.new_context(no_viewport=True)
         page = ctx.new_page()
 
@@ -1228,14 +1232,19 @@ def phase_browser_renewal(cookies=None):
         log.error("Browser mode failed: %s", e)
         return "failed"
 
-def phase_api_renewal(use_cookies=None):
-    """Phase 3: Use provided cookies to renew server via pure API (no browser)."""
+def phase_api_renewal(use_cookies=None) -> RenewReport:
+    """Phase 3: Use provided cookies to renew server via pure API (no browser).
+
+    返回 RenewReport（不再自己发通知，也不再用 bool 表达成功/失败）——
+    「发什么」和「退出码多少」都交给调用方那一次 finish()。
+    """
     log.info("=== PURE API RENEWAL MODE ===")
     cookies = use_cookies or []
 
     if not cookies:
         log.error("No valid cookies/session available - cannot proceed")
-        return False
+        return _to_renew_report(_new_report(
+            error="沒有可用的 session cookie"))
 
     log.info("Using %d cookies for API authentication", len(cookies))
     api_session = get_api_session()
@@ -1263,14 +1272,7 @@ def phase_api_renewal(use_cookies=None):
     })
 
     # Pre-define report so error handlers can use it
-    report = {
-        "server_id": SERVER_ID,
-        "status": "unknown",
-        "action": "none",
-        "expiry": None,
-        "error": None,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
+    report = _new_report()
 
     # Verify session by checking a safe endpoint
     try:
@@ -1308,6 +1310,10 @@ def phase_api_renewal(use_cookies=None):
         server_url = None
         server_data = None
         used_path = None
+        # 探测失败的原因要分开记：「上游 5xx」与「出口被风控」处置完全不同
+        probe_5xx = 0
+        probe_blocked = 0
+        probe_net = 0
 
         for path in candidate_paths:
             url = f"{DASHBOARD_URL}{path}"
@@ -1333,22 +1339,36 @@ def phase_api_renewal(use_cookies=None):
                 # 403 + JSON = path exists but VPN/IP blocked
                 if resp.status_code == 403 and is_json:
                     log.warning("  Path exists but blocked: %s", resp.text[:200])
+                    if any(h in resp.text.lower() for h in BLOCKED_HINTS):
+                        probe_blocked += 1
                     # The path is correct but we can't access via current IP
                     # If proxy is configured, this shouldn't happen
+                    continue
+
+                # 上游 5xx：面板自己挂了，跟我们的出口/session 无关
+                if resp.status_code >= 500:
+                    probe_5xx += 1
+                    log.warning("  上游 %d，记一次上游故障", resp.status_code)
                     continue
 
                 # Other errors - log and continue
                 log.warning("  Unexpected: %d body[:200]=%s", resp.status_code, resp.text[:200])
             except requests.exceptions.RequestException as e:
+                probe_net += 1
                 log.warning("  Request failed: %s", e)
                 continue
 
         if not server_data:
             log.error("Could not find a working API endpoint for server info")
-            log.error("Probed %d paths, none returned 200+JSON", len(candidate_paths))
-            report["error"] = "No working API endpoint found. Probed paths: " + ", ".join(candidate_paths[:5]) + "..."
-            _report(report)
-            return False
+            log.error("Probed %d paths, none returned 200+JSON (5xx=%d blocked=%d net=%d)",
+                      len(candidate_paths), probe_5xx, probe_blocked, probe_net)
+            report["error"] = (
+                f"面板 API 全部探测失败（{len(candidate_paths)} 条路径；"
+                f"5xx={probe_5xx} 风控={probe_blocked} 网络={probe_net}）"
+            )
+            # 全是 5xx / 连不上 -> 上游故障，别标红；有 403 风控 -> 要换节点，算失败
+            report["transient"] = (probe_5xx + probe_net) > 0 and probe_blocked == 0
+            return _to_renew_report(report)
 
         log.info("Using endpoint: %s", used_path)
         log.info("Server data received (truncated): %s", json.dumps(server_data, indent=2, ensure_ascii=False)[:800])
@@ -1487,6 +1507,7 @@ def phase_api_renewal(use_cookies=None):
                             expiry_dt = expiry_dt.replace(tzinfo=timezone.utc)
                         delta = expiry_dt - now_dt
                         total_h = max(0, int(delta.total_seconds() // 3600))
+                        report["expire_at"] = expiry_dt.astimezone(timezone.utc).isoformat()
                         log.info("Expiry (ISO): %s => %d hours remaining (now=%s)", expiry_val, total_h, now_dt.isoformat())
                     except Exception as e:
                         log.warning("Failed to parse ISO datetime %s: %s", expiry_val, e)
@@ -1499,8 +1520,12 @@ def phase_api_renewal(use_cookies=None):
                     days = int(m.group(1)) if m else 0
                     hours = int(h.group(1)) if h else 0
                     total_h = days * 24 + hours
+                    report["expire_at"] = (
+                        datetime.now(timezone.utc) + timedelta(hours=total_h)
+                    ).isoformat()
                     log.info("Expiry (string): %s = %d days %d h = %d h total", expiry_val, days, hours, total_h)
 
+                report["hours_left"] = total_h
                 should_renew = FORCE_RENEW or total_h < RENEW_THRESHOLD_HOURS
                 if should_renew:
                     log.info("Renewing server (%d h left, threshold: %dh)", total_h, RENEW_THRESHOLD_HOURS)
@@ -1629,120 +1654,258 @@ def phase_api_renewal(use_cookies=None):
                         report["error"] = "Renewal failed - could not find correct body format"
                 else:
                     report["action"] = "skipped"
-                    log.info("Not renewing - %d hours remaining (threshold: 48)", total_h)
+                    log.info("Not renewing - %d hours remaining (threshold: %d)",
+                             total_h, RENEW_THRESHOLD_HOURS)
             else:
                 report["action"] = "skipped"
                 log.warning("No expiry field in API response")
 
-        # Captcha 挡住时: 照样发报告说明情况, 但不再把 action 改成"合法"状态。
-        # 续期没发生就应该让 workflow 报 failure —— 静默 green 会让人以为还在自动续期,
+        # Captcha 挡住时: 照样出报告说明情况，但 outcome 仍是 FAILED。
+        # 续期没发生就应该让 workflow 报 failure —— 静默 green 会让人以为还在自动续期，
         # 实际服务器已到期。TG 报告里会写清楚需要手动处理。
         if report.get("error") and "captcha" in str(report["error"]).lower():
             log.info("ℹ️ Captcha required - please use the userscript in your browser to renew")
             log.info("    Report is pushed; this run is marked as failure so it stays visible")
-            report["action"] = "manual_renewal_required"
-        # 只发一次报告（放到 captcha 判断之后，避免重复推送）
-        _report(report)
-        # 成功判定: 只有 (a) 真的续期成功, 或 (b) 到期时间充足而合法跳过, 才算成功。
-        # 之前这里无条件 return True —— 续期失败时 workflow 仍显示 success,
-        # cron 会静默失败。与 IceHost 那次 6h/600 差值永远 miss threshold 是同一类 bug
-        # (成功判定和实际操作脱节)。
-        _action = report.get("action")
-        _err = report.get("error")
-        if _action in ("renewed", "skipped") and not _err:
-            return True
-        log.error("API 续期未真正完成 (action=%r, error=%r)", _action, _err)
-        return False
+
+        rr = _to_renew_report(report)
+        if classify(report) is Outcome.FAILED:
+            log.error("API 续期未真正完成 (action=%r, error=%r)",
+                      report.get("action"), report.get("error"))
+        return rr
 
     except requests.exceptions.RequestException as e:
         log.error("API request error: %s", e)
+        status = getattr(getattr(e, "response", None), "status_code", 0) or 0
         report["error"] = f"API request failed: {str(e)}"
-        _report(report)
-        return False
+        # 5xx / 429 / 连不上（status=0）= 上游或网络问题，等下次排程，别标红
+        report["transient"] = status >= 500 or status == 429 or status == 0
+        return _to_renew_report(report)
     except Exception as e:
         log.error("API renewal failed unexpectedly: %s", e)
         report["error"] = str(e)
-        _report(report)
-        return False
+        return _to_renew_report(report)
 
 
-def _report(report):
-    status_icon = "\U0001F7E2" if report["status"] == "running" else "\U0001F534"
-    action_icons = {
-        "started": "▶️", "renewed": "🔄", "skipped": "⏭️",
-        "renew-failed": "⚠️", "none": "📋",
-        "start-failed": "❓", "login-failed": "🔒",
-        "manual_renewal_required": "🔔",
+#: 上游故障的特征词。命中 -> TRANSIENT（不标红，等下次排程）。
+TRANSIENT_HINTS = (
+    "502", "503", "504", "520", "521", "522", "523", "524",
+    "timeout", "timed out", "connection reset", "connection aborted",
+    "temporarily unavailable", "bad gateway", "service unavailable",
+)
+
+#: 出口被风控挡住的信号。这**不是**上游故障 —— 要换节点，属于人工处理。
+BLOCKED_HINTS = ("vpn or proxy detected", "access blocked", "/blocked")
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _new_report(**over) -> dict:
+    """内部 report 字典的统一起点（旧版在三处手抄同一个字面量）。"""
+    base = {
+        "server_id": SERVER_ID,
+        "status": "unknown",
+        "action": "none",
+        "expiry": None,
+        "expire_at": None,
+        "hours_left": None,
+        "error": None,
+        "transient": False,
+        "timestamp": _now_iso(),
     }
-    action_cn = {
-        "started": "已启动", "renewed": "已续期", "skipped": "已跳过",
-        "none": "无操作", "manual_renewal_required": "需手动续期",
-    }
-    status_cn = "运行中" if report["status"] == "running" else "已停止"
-    action_text = action_cn.get(report["action"], report["action"])
+    base.update(over)
+    return base
 
-    lines = [
-        f"**Zampto 服务器报告**",
-        f"",
-        f"**服务器 ID:** `{report['server_id']}`",
-        f"**状态:** {status_icon} {status_cn}",
-        f"**操作:** {action_icons.get(report['action'], '❓')} {action_text}",
-    ]
-    if report.get("expiry"):
-        lines.append(f"**到期:** {report['expiry']}")
-    if report.get("error"):
-        lines.append(f"**错误:** {report['error']}")
-    if report.get("action") == "manual_renewal_required":
-        lines.extend([
-            f"",
-            f"**请手动续期**",
-            f"API 续期需要人机验证，请在浏览器中打开 Zampto 控制台手动续期。"
-        ])
-    lines.append(f"")
-    lines.append(f"*生成: {report['timestamp']}*")
-    body = "\n".join(lines)
 
-    log.info("--- Report ---\n%s", body)
-    # 方案 B 極致精簡兩行版
-    if report.get("action") == "renewed":
-        exp = f"至 {report.get('expiry')}" if report.get("expiry") else ""
-        push_tg(f"✅ Zampto（{report['server_id']}） · 成功續期 {exp}".strip(),
-                "ℹ️ 服務已自動展期")
-    elif report.get("action") == "skipped":
-        exp = f"{report.get('expiry')} 到期 · " if report.get("expiry") else ""
-        push_tg(f"🟢 Zampto（{report['server_id']}） · 狀態良好",
-                f"ℹ️ {exp}未到續期窗口")
-    elif report.get("error") or "fail" in str(report.get("action")):
-        err = report.get("error") or "續期異常"
-        push_tg(f"🚨 Zampto（{report['server_id']}） · 續期未完成",
-                f"⚠️ {err[:60]} · 請登入面板手動處理")
-    else:
-        push_tg(f"🟢 Zampto（{report['server_id']}） · 狀態良好",
-                "ℹ️ 服務正常運行中")
+def renewal_to_expiry(renewal_raw):
+    """renewal（上次续期时间 ISO）-> (到期时间 ISO, 剩余小时)。
+
+    Zampto 的 renewal 字段是「上次续期时间」，到期 = renewal + 48h。
+    直接把它当到期时间会渲染出一个已经过去的日期 —— 这是这个面板最容易踩的
+    字段语义坑，集中在这里算一次。
+    """
+    if not renewal_raw:
+        return None, None
+    m = re.match(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})", str(renewal_raw))
+    if not m:
+        return None, None
+    try:
+        dt = datetime.fromisoformat(m.group(1)).replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None, None
+    exp = dt + timedelta(hours=48)
+    hours = int((exp - datetime.now(timezone.utc)).total_seconds() // 3600)
+    return exp.isoformat(), hours
+
+
+def classify(report) -> Outcome:
+    """内部 report 字典 -> renewkit Outcome。
+
+    优先级：显式 transient 标记 > 出口被风控 > 业务动作 > 错误文本特征。
+    """
+    if report.get("transient"):
+        return Outcome.TRANSIENT
+    action = str(report.get("action") or "none")
+    err = str(report.get("error") or "")
+    low = err.lower()
+    if any(h in low for h in BLOCKED_HINTS):
+        return Outcome.FAILED          # 出口被标记，要换节点，不是等下次排程
+    if action == "renewed":
+        return Outcome.RENEWED
+    if action == "skipped" and not err:
+        return Outcome.SKIPPED
+    if err and any(h in low for h in TRANSIENT_HINTS):
+        return Outcome.TRANSIENT
+    return Outcome.FAILED
+
+
+def _save_report_json(report) -> None:
     try:
         os.makedirs(LOG_DIR, exist_ok=True)
         with open(os.path.join(LOG_DIR, "report.json"), "w", encoding="utf-8") as f:
-            json.dump(report, f, indent=2, ensure_ascii=False)
+            json.dump(report, f, indent=2, ensure_ascii=False, default=str)
         log.info("Report saved")
     except Exception as e:
         log.warning("Report 保存失败(可忽略): %s", e)
 
 
-def main():
+def _human_summary(report, outcome, hours) -> str:
+    """给人看的诊断块（只有 log 会看到；TG 发的是 renewkit 的两行版）。"""
+    status_cn = "运行中" if report.get("status") == "running" else "已停止"
+    lines = [
+        f"**Zampto 服务器报告** · {timeutil.now_local()}",
+        "",
+        f"**服务器 ID:** `{report.get('server_id')}`",
+        f"**状态:** {status_cn}",
+        f"**结果:** {outcome.value}",
+    ]
+    if report.get("expiry"):
+        lines.append(f"**面板 renewal:** {report['expiry']}")
+    if report.get("expire_at"):
+        lines.append(f"**到期:** {report['expire_at']}（剩 {hours}h）")
+    if report.get("error"):
+        lines.append(f"**错误:** {report['error']}")
+    if outcome is Outcome.FAILED and "captcha" in str(report.get("error") or "").lower():
+        lines += ["", "**请手动续期**",
+                  "API 续期需要人机验证，请在浏览器中打开 Zampto 控制台手动续期。"]
+    return "\n".join(lines)
+
+
+def _to_renew_report(report) -> RenewReport:
+    """内部 report 字典 -> RenewReport（纯适配，不发通知）。
+
+    为什么留着内部字典：phase_api_renewal 里到处在改它的字段，改成 dataclass
+    要动的地方太多。这里只做一层薄适配，**语义仍由 renewkit 统一裁决**。
+    """
+    outcome = classify(report)
+    target = f"Zampto（{report.get('server_id') or SERVER_ID or '?'}）"
+    hours = report.get("hours_left")
+
+    detail = shorten(report.get("error") or "", 120)
+    if outcome is Outcome.SKIPPED:
+        detail = (f"未到续期窗口（剩 {hours}h，阈值 {RENEW_THRESHOLD_HOURS}h）"
+                  if isinstance(hours, int) else "未到续期窗口")
+    elif outcome is Outcome.RENEWED and isinstance(hours, int):
+        detail = f"服務已自動展期（{hours}h 後到期）"
+    elif outcome is Outcome.FAILED and not detail:
+        detail = "續期未完成"
+
+    log.info("--- Report ---\n%s", _human_summary(report, outcome, hours))
+    _save_report_json(report)
+
+    rr = RenewReport(service=SERVICE)
+    rr.add(target, outcome, expire=report.get("expire_at"), detail=detail)
+    return rr
+
+
+def _finish(report) -> int:
+    """渲染 + 打印 + 发一条 TG + 返回退出码。"""
+    return _to_renew_report(report).finish()
+
+
+def _fmt_remaining(expire_at) -> str:
+    """ISO 到期时间 -> "1d 12h 30min"（给人看的精确剩余量）。"""
+    if not expire_at:
+        return ""
+    try:
+        exp = datetime.fromisoformat(expire_at)
+    except ValueError:
+        return ""
+    if exp.tzinfo is None:
+        exp = exp.replace(tzinfo=timezone.utc)
+    total_s = int((exp - datetime.now(timezone.utc)).total_seconds())
+    if total_s <= 0:
+        return "已到期"
+    d, rem = divmod(total_s, 86400)
+    h, rem = divmod(rem, 3600)
+    m = rem // 60
+    parts = []
+    if d:
+        parts.append(f"{d}d")
+    if h:
+        parts.append(f"{h}h")
+    parts.append(f"{m}min")
+    return " ".join(parts)
+
+
+def _query_expiry(cookies, *, wait_for_fresh: bool) -> tuple:
+    """查面板 renewal，返回 (到期 ISO, 剩余小时, 人话字符串)。
+
+    wait_for_fresh：续期刚成功时服务器更新 renewal 有几秒延迟，重试 3 次、
+    且要求拿到的是 60s 内的新值，否则继续等（旧版内联循环，抽出来复用）。
+    """
+    for attempt in range(3 if wait_for_fresh else 1):
+        if wait_for_fresh:
+            time.sleep(3)          # 给服务器一点缓存刷新时间
+        try:
+            api = get_api_session()
+            sync_cookies_to_session(api, cookies)
+            r = api.get(f"{DASHBOARD_URL}/api/servers", timeout=10)
+            if r.status_code != 200:
+                continue
+            for sv in (r.json().get("servers") or []):
+                if str(sv.get("id")) != str(SERVER_ID):
+                    continue
+                raw = sv.get("renewal", "")
+                if not raw:
+                    break
+                expire_at, hours = renewal_to_expiry(raw)
+                if wait_for_fresh:
+                    try:
+                        age = (datetime.now(timezone.utc)
+                               - datetime.fromisoformat(raw.replace("Z", "+00:00"))
+                               ).total_seconds()
+                    except Exception:
+                        age = 0.0
+                    log.info("  尝试 %d: renewal=%s (age=%.0fs)", attempt + 1, raw, age)
+                    if age > 60:
+                        continue       # 服务器还没更新，再等
+                human = _fmt_remaining(expire_at)
+                log.info("  ✓ 到期时间: %s（%s）", expire_at, human)
+                return expire_at, hours, human
+        except Exception as e:
+            log.warning("  查询 renewal 失败 (尝试 %d): %s", attempt + 1, e)
+    log.warning("⚠️ 查不到 renewal 字段，报告里不带到期时间")
+    return None, None, ""
+
+
+def main() -> int:
     # Validate env vars
     if not all([USERNAME, PASSWORD, SERVER_ID]):
         log.error("Missing required env vars: USERNAME, PASSWORD, SERVER_ID")
-        push_tg(f"🚨 Zampto（{SERVER_ID}） · 續期未完成",
-                "⚠️ 缺少 ZAMPTO 憑據 · 請至 GitHub Secrets 配置")
-        return
+        return _finish(_new_report(
+            error="缺少 ZAMPTO 憑據（ZAMPTO_USERNAME / ZAMPTO_PASSWORD / "
+                  "ZAMPTO_SERVER_ID）· 請至 GitHub Secrets 配置"))
 
     log.info("=== Zampto Auto Renewal v5 ===")
     log.info("Server ID: %s | Force: %s", SERVER_ID, FORCE_RENEW)
 
     # ── Determine mode: GitHub (pure API) or Local (hybrid) ────────
-    is_github_actions = bool(os.getenv("GITHUB_ACTION") or os.getenv("CI"))
-    session_secret = os.getenv("ZAMPTO_SESSION_SECRET")
+    is_github_actions = bool(env.get("GITHUB_ACTION") or env.get("CI"))
+    session_secret = env.get("ZAMPTO_SESSION_SECRET")
     cookies = None
+    auth_error = ""
 
     # Mode A: GitHub Actions – pure API via ZAMPTO_SESSION_SECRET
     if is_github_actions and session_secret:
@@ -1756,8 +1919,8 @@ def main():
                 raise ValueError("No cookies found in session secret")
         except Exception as e:
             log.error("Failed to parse ZAMPTO_SESSION_SECRET: %s", e)
-            push_tg(f"🚨 Zampto（{SERVER_ID}） · 續期未完成",
-                    f"⚠️ ZAMPTO_SESSION_SECRET 解碼失敗 · 請登入面板手動處理")
+            auth_error = ("ZAMPTO_SESSION_SECRET 解碼失敗（secret 要係 "
+                          "session.json 的 base64 全文）")
             cookies = None  # fall through to fail cleanly
 
     # Mode B: Local dev – try saved session file
@@ -1771,16 +1934,10 @@ def main():
     # Mode C: No session available – FAIL
     if not cookies:
         log.error("No valid authentication available - cannot proceed")
-        reason = "Missing ZAMPTO_SESSION_SECRET (GitHub) OR missing ./screenshots/session.json (local)"
-        push_tg(f"🚨 Zampto（{SERVER_ID}） · 續期未完成",
-                "⚠️ Session 認證失效 · 請登入面板手動處理")
-        report = {
-            "server_id": SERVER_ID, "status": "unknown", "action": "none",
-            "expiry": None, "error": reason,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
-        _report(report)
-        sys.exit(1)  # Non-zero exit so workflow marks as failure
+        return _finish(_new_report(
+            error=auth_error or
+            "Session 認證失效：GitHub 上缺 ZAMPTO_SESSION_SECRET，"
+            "本地缺 ./screenshots/session.json"))
 
     # 优先: 浏览器续期 (点击 Renew 按钮后由页面 JS 发请求, 自动携带正确 CSRF;
     #        配合 solve_turnstile 处理 Cloudflare 人机验证)
@@ -1788,134 +1945,28 @@ def main():
     log.info("Starting browser-based renewal (Turnstile-aware)...")
     status = phase_browser_renewal(cookies=cookies)
 
-    # 查询最新到期时间
-    # 续期成功后服务器更新 renewal 字段可能有几秒延迟, 用重试 + 等待机制确保
-    # 拿到的是续期后的新值, 而不是续期前的旧值.
-    expiry_str = ""
-    if status == "renewed":
-        # 续期刚成功, 等服务器更新 renewal 字段
-        log.info("等待服务器更新 renewal 字段...")
-        for attempt in range(3):
-            time.sleep(3)  # 给服务器 3s 缓存刷新时间
-            try:
-                api = get_api_session()
-                sync_cookies_to_session(api, cookies)
-                r = api.get(f"{DASHBOARD_URL}/api/servers", timeout=10)
-                if r.status_code != 200:
-                    continue
-                for sv in (r.json().get("servers") or []):
-                    if str(sv.get("id")) == str(SERVER_ID):
-                        exp_raw = sv.get("renewal", "")
-                        if not exp_raw:
-                            continue
-                        from datetime import datetime as dt_cls, timedelta
-                        try:
-                            dt_ob = dt_cls.fromisoformat(exp_raw.replace("Z", "+00:00"))
-                            # 新 renewal 应该接近 now (续期刚发生), 旧 renewal 会比 now 早很多
-                            now = datetime.now(timezone.utc)
-                            age_s = (now - dt_ob).total_seconds()
-                            log.info(f"  尝试 {attempt+1}: renewal={exp_raw} (age={age_s:.0f}s)")
-                            # 续期成功后 renewal 应该是 0-300s 内的时间戳
-                            # 如果 age > 60s, 说明服务器还没更新, 再等
-                            if age_s > 60:
-                                continue
-                            # 通过, 算 expiry_str
-                            expires_at = dt_ob + timedelta(hours=48)
-                            if expires_at.tzinfo is None:
-                                expires_at = expires_at.replace(tzinfo=timezone.utc)
-                            total_s = int((expires_at - now).total_seconds())
-                            if total_s > 0:
-                                d = total_s // 86400
-                                h = (total_s % 86400) // 3600
-                                m = (total_s % 3600) // 60
-                                parts = []
-                                if d > 0: parts.append(f"{d}d")
-                                if h > 0: parts.append(f"{h}h")
-                                parts.append(f"{m}min")
-                                expiry_str = " ".join(parts)
-                                log.info(f"  ✓ 到期时间已更新: {expiry_str}")
-                                break
-                        except Exception as e:
-                            log.warning(f"  解析 renewal 失败: {e}")
-                        break
-                if expiry_str:
-                    break
-            except Exception as e:
-                log.warning(f"  查询 renewal 失败 (尝试 {attempt+1}): {e}")
-        if not expiry_str:
-            log.warning("⚠️ 3 次尝试后仍未拿到更新的 renewal 字段, 用首次查询值兜底")
-    # 跳过续期 / 续期失败的情况下, 单次查询就够 (不需要等)
-    if not expiry_str:
-        try:
-            api = get_api_session()
-            sync_cookies_to_session(api, cookies)
-            r = api.get(f"{DASHBOARD_URL}/api/servers", timeout=10)
-            if r.status_code == 200:
-                for sv in (r.json().get("servers") or []):
-                    if str(sv.get("id")) == str(SERVER_ID):
-                        exp_raw = sv.get("renewal", "")
-                        if exp_raw:
-                            from datetime import datetime as dt_cls, timedelta
-                            try:
-                                dt_ob = dt_cls.fromisoformat(exp_raw.replace("Z", "+00:00"))
-                                expires_at = dt_ob + timedelta(hours=48)
-                                now = datetime.now(timezone.utc)
-                                if expires_at.tzinfo is None:
-                                    expires_at = expires_at.replace(tzinfo=timezone.utc)
-                                total_s = int((expires_at - now).total_seconds())
-                                if total_s > 0:
-                                    d = total_s // 86400
-                                    h = (total_s % 86400) // 3600
-                                    m = (total_s % 3600) // 60
-                                    parts = []
-                                    if d > 0: parts.append(f"{d}d")
-                                    if h > 0: parts.append(f"{h}h")
-                                    parts.append(f"{m}min")
-                                    expiry_str = " ".join(parts)
-                            except:
-                                pass
-                        break
-        except:
-            pass
-
-    if status == "renewed":
-        log.info("✓ 续期成功")
-        try:
-            exp_part = f"至 {expiry_str}" if expiry_str else ""
-            push_tg(f"✅ Zampto（{SERVER_ID}） · 成功續期 {exp_part}".strip(),
-                    "ℹ️ 服務已自動展期")
-        except Exception as e:
-            log.warning("TG 通知失败(忽略): %s", e)
-        # 用 os._exit 替代 sys.exit: sys.exit 触发 SystemExit 异常, 在 Playwright/
-        # CloakBrowser 的 event loop 中可能被替换为非 0 退出码导致 workflow 显示失败
-        # (续期其实已成功, 仅退出码问题). os._exit 跳过 finalizer, 直接退出 0
-        os._exit(0)
-    elif status == "skipped":
-        log.info("⏭️ 剩余时间充足, 跳过续期")
-        try:
-            exp_part = f"{expiry_str} 到期 · " if expiry_str else ""
-            push_tg(f"🟢 Zampto（{SERVER_ID}） · 狀態良好",
-                    f"ℹ️ {exp_part}未到續期窗口")
-        except Exception as e:
-            log.warning("TG 通知失败(忽略): %s", e)
-        os._exit(0)
+    if status in ("renewed", "skipped"):
+        if status == "renewed":
+            log.info("✓ 续期成功")
+        else:
+            log.info("⏭️ 剩余时间充足, 跳过续期")
+        expire_at, hours, human = _query_expiry(
+            cookies, wait_for_fresh=(status == "renewed"))
+        return _finish(_new_report(
+            action=status, status="running",
+            expire_at=expire_at, hours_left=hours, expiry=human))
 
     # 浏览器未成功(failed): 尝试 API 模式 (可能 CSRF 失败, 但值得一试)
     log.info("浏览器续期未成功(%s), 尝试 API 模式...", status)
-    api_ok = phase_api_renewal(use_cookies=cookies)
-    if api_ok:
-        log.info("✅ API 续期流程完成 (报告已通过 API 路径推送)")
-        os._exit(0)
-
-    # 两种方式都失败
-    log.error("❌ 浏览器和 API 续期均失败")
-    try:
-        push_tg(f"🚨 Zampto（{SERVER_ID}） · 續期未完成",
-                "⚠️ 瀏覽器同 API 續期均未成功 · 請登入面板手動處理")
-    except Exception as e:
-        log.warning("TG 通知失败(忽略): %s", e)
-    os._exit(1)
+    rr = phase_api_renewal(use_cookies=cookies)
+    log.info("API 路径结果: %s", rr.worst.value)
+    # 报告与退出码都在这里统一落地（旧版这条路上会发两条 🚨：API 路径自己发一条，
+    # main 又发一条）
+    return rr.finish()
 
 
 if __name__ == "__main__":
-    main()
+    # 用 os._exit 而非 sys.exit：sys.exit 抛 SystemExit，在 Playwright 的事件
+    # 循环里可能被改写成非 0 退出码（续期明明成功、job 却标红）。os._exit 跳过
+    # finalizer 直接落地退出码 —— 所以退出码必须由 Outcome 算准。
+    os._exit(main())

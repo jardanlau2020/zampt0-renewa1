@@ -1,3 +1,15 @@
+# 本地登录产物（phase1_setup.bat 会把 session 存这里）
+screenshots/
 SESSION_SECRET.txt
 dashboard.html
+
+# 排障产物
+results/
+*.mp4
+
+# 凭据
+.env
+
+# Python
 __pycache__/
+*.pyc
