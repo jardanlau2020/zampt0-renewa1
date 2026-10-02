@@ -989,6 +989,10 @@ def phase_browser_renewal(cookies=None):
                 if str(sv.get("id")) == str(SERVER_ID):
                     exp_raw = sv.get("renewal", "")
                     baseline_renewal = exp_raw or None
+                    if not exp_raw:
+                        # 同上：字段读不到 = 剩余时间闸门形同虚设，会无条件续期。
+                        log.warning("  预检查读不到 renewal；该服务器 keys=%s",
+                                    sorted(sv.keys()))
                     if exp_raw:
                         from datetime import datetime as dt_cls, timedelta
                         dt_ob = dt_cls.fromisoformat(exp_raw.replace("Z", "+00:00"))
@@ -1869,6 +1873,20 @@ def _query_expiry(cookies, *, wait_for_fresh: bool) -> tuple:
                     continue
                 raw = sv.get("renewal", "")
                 if not raw:
+                    # 面板字段改名了的话，这里会一直查不到 → 续期闸门失效、
+                    # 每轮都真续一次（run #83 就是这么发生的）。把真实 key
+                    # 打出来，下一轮日志就能直接告诉我们该读哪个字段。
+                    # 只打字段名和「像时间」的值，其余只打类型，避免泄密。
+                    if attempt == 0:
+                        log.warning("  /api/servers 缺 renewal 字段；该服务器 keys=%s",
+                                    sorted(sv.keys()))
+                        guess = {
+                            k: (str(v)[:40] if re.search(
+                                r"renew|expir|date|due|end|valid|until|left", k, re.I)
+                                else f"<{type(v).__name__}>")
+                            for k, v in sv.items()
+                        }
+                        log.warning("  疑似时间字段: %s", guess)
                     break
                 expire_at, hours = renewal_to_expiry(raw)
                 if wait_for_fresh:

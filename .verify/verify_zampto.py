@@ -560,6 +560,14 @@ def group_c() -> None:
     check("C22 有 BLOCKED_HINTS", "BLOCKED_HINTS = (" in CODE)
     check("C23 风控信号含 vpn or proxy detected",
           "vpn or proxy detected" in APP_SRC.lower())
+    # run #83 发现：面板 /api/servers 读不到 renewal → 剩余时间闸门失效 →
+    # 每 8 小时都会真续一次。留了诊断日志，下一轮就能看到真实字段名。
+    check("C24 _query_expiry 缺字段时打 keys 诊断",
+          "缺 renewal 字段；该服务器 keys=" in APP_SRC)
+    check("C25 浏览器预检查也打 keys 诊断",
+          "预检查读不到 renewal；该服务器 keys=" in APP_SRC)
+    check("C26 诊断只打字段名/时间值，不打整对象",
+          "f\"<{type(v).__name__}>\"" in APP_SRC)
 
     # ---- workflow
     check("C30 workflow 引用 renew-kit composite action",
