@@ -615,6 +615,35 @@ def group_c() -> None:
         check("C73 run_zampto 透传退出码", 'exit "$PYTHON_EXIT"' in rs)
         check("C74 run_zampto 支持录屏开关", "ENABLE_RECORDING" in rs)
 
+    # ---- 换行符（run #82 的教训）
+    # setup_proxy.sh 是用 Python 从旧 YAML 的 run 块抽出来再 open("w") 写的，
+    # Windows 上默认把 \n 翻成 \r\n；推上去之后 runner 的 bash 在
+    # `set -e\r` 处炸成 "set: -: invalid option"。Cygwin 的 bash -n 对此
+    # 相当宽容，D7 根本抓不到 —— 所以必须在字节层面钉死。
+    for f in (SETUP_PROXY, RUN_SH):
+        if not f.exists():
+            continue
+        raw = f.read_bytes()
+        eq(f"C90 {f.name} 不含 CR（LF 结尾）", b"\r" in raw, False)
+        check(f"C91 {f.name} 首行是 shebang", raw.startswith(b"#!"), raw[:20])
+        # 第一行的换行必须是裸 \n，否则就是 CRLF 没转干净
+        first_nl = raw.find(b"\n")
+        check(f"C92 {f.name} 首行换行为 LF",
+              first_nl > 0 and raw[first_nl - 1] != 0x0D, repr(raw[max(0, first_nl - 3):first_nl + 1]))
+
+    # 顺带扫一遍仓库里其它会被 shell / runner 读到的文本文件
+    _cr_offenders = []
+    for p in sorted(ROOT.rglob("*")):
+        if not p.is_file():
+            continue
+        if any(x in p.parts for x in (".git", "screenshots", "__pycache__", "results")):
+            continue
+        if p.suffix not in (".sh", ".yml", ".yaml", ".bat", ".ps1"):
+            continue
+        if b"\r" in p.read_bytes():
+            _cr_offenders.append(str(p.relative_to(ROOT)))
+    eq("C93 仓库内无任何 CRLF 的脚本/配置", _cr_offenders, [])
+
     # ---- README / .gitignore / 死文件
     if README.exists():
         rd = README.read_text(encoding="utf-8")
