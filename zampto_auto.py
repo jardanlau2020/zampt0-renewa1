@@ -1238,6 +1238,29 @@ def phase_browser_renewal(cookies=None):
             except Exception as e:
                 log.warning("  [COOKIE] 快照失败(%s): %s", tag, e)
 
+        def _verify_renewed(*, tries=1, sleep_ms=3000):
+            """用页内 renewal 变化判定是否真的续期成功。
+
+            返回 (changed, new_renewal)。changed=True 才算真续上 ——
+            HTTP 200 不算：面板对「还没到窗口」的 no-op 请求也回 200
+            （run #88：状态码 200，renewal 前后都是 2026-10-02T05:39:58Z）。
+
+            tries>1 用于「续期后服务端更新 renewal 有延迟」的场景。
+            """
+            last = None
+            for i in range(max(1, tries)):
+                if i:
+                    page.wait_for_timeout(sleep_ms)
+                last, _ = read_renewal_in_page(page, SERVER_ID)
+                if last and last != baseline_renewal:
+                    exp_iso, exp_h = renewal_to_expiry(last)
+                    if exp_iso:
+                        _PAGE_STATE["expiry"] = (exp_iso, exp_h, _fmt_remaining(exp_iso))
+                        log.info("  [页内读数] 续期后到期: %s（%s）",
+                                 exp_iso, _PAGE_STATE["expiry"][2])
+                    return True, last
+            return False, last
+
         _snapshot_cookies("导航后")
 
         # 以页面为准：先看页面自己打了哪些 API，再在页内试打候选端点。
@@ -1261,6 +1284,10 @@ def phase_browser_renewal(cookies=None):
         # 因此闸门放在这里。
         raw_in_page, _ids = read_renewal_in_page(page, SERVER_ID)
         if raw_in_page:
+            # 页内读到的 renewal 就是后续「有没有真的续上」的基准值。
+            # 之前 baseline 来自 requests 预检查，而那条路恒 401 → baseline
+            # 永远是 None → 无法判定，只能退回「看 HTTP 状态」这种错判。
+            baseline_renewal = raw_in_page
             exp_iso, exp_h = renewal_to_expiry(raw_in_page)
             if exp_iso:
                 human = _fmt_remaining(exp_iso)
@@ -1293,32 +1320,26 @@ def phase_browser_renewal(cookies=None):
 
         renewed, data = renew_via_browser_fetch(page, sid, explicit_csrf=browser_csrf_token)
         if renewed:
-            log.info("续期成功! response: %s", data.get("body", "")[:200])
+            log.info("fetch 路径报告成功, response: %s", data.get("body", "")[:200])
+            # 同样不认 HTTP 状态，只认 renewal 有没有变（run #88 的教训）。
             _snapshot_cookies("续期后")
-            # 续期后服务端更新 renewal 有几秒延迟，页内重试几次；要求拿到
-            # 「刚发生」的值（age 小），否则继续等 —— 与 _query_expiry 的
-            # wait_for_fresh 语义一致，只是换成在页面里读。
-            for _try in range(3):
-                raw_after, _ids2 = read_renewal_in_page(page, SERVER_ID)
-                if raw_after:
-                    exp_iso2, exp_h2 = renewal_to_expiry(raw_after)
-                    if exp_iso2:
-                        try:
-                            age2 = (datetime.now(timezone.utc)
-                                    - datetime.fromisoformat(raw_after.replace("Z", "+00:00"))
-                                    ).total_seconds()
-                        except Exception:
-                            age2 = 0.0
-                        log.info("  [页内读数] 尝试 %d: renewal=%s (age=%.0fs)",
-                                 _try + 1, raw_after, age2)
-                        if age2 <= 60 or _try == 2:
-                            _PAGE_STATE["expiry"] = (exp_iso2, exp_h2, _fmt_remaining(exp_iso2))
-                            log.info("  [页内读数] 续期后到期时间: %s（%s）",
-                                     exp_iso2, _PAGE_STATE["expiry"][2])
-                            break
-                page.wait_for_timeout(3000)
+            changed, new_renewal = _verify_renewed(tries=3)
+            log.info("续期后 renewal: %r (点击前: %r)", new_renewal, baseline_renewal)
             browser.close()
-            return "renewed"
+            if changed:
+                log.info("✅ 续期确认成功: renewal 已更新 %s -> %s",
+                         baseline_renewal, new_renewal)
+                return "renewed"
+            if new_renewal:
+                log.info("⏭️ renewal 未变化（fetch 回了成功但窗口没延长）"
+                         "—— 视为还没到续期窗口，按「状态良好」报")
+                return "skipped"
+            if data.get("status") in (200, 201, 204, 202):
+                log.warning("⚠️ 读不到 renewal，无法确认；只能按 HTTP %s 判成功（旧行为）",
+                            data.get("status"))
+                return "renewed"
+            log.error("❌ 续期失败: fetch 未成功且读不到 renewal")
+            return "failed"
 
         # 如果 fetch 失败, 尝试从页面找续期按钮
         log.info("fetch 失败, 尝试在页面中寻找 Renew 按钮...")
@@ -1367,30 +1388,42 @@ def phase_browser_renewal(cookies=None):
                 log.info("按钮点击完成, 等待 3s 后验证续期结果...")
                 page.wait_for_timeout(3000)
 
-                # v3 关键改进: 优先用拦截器捕获的 renew 响应判断结果 (最可靠)
-                # 1) 页面自身 JS 发的 renew 请求结果 (有则最权威, 直接看 status + body)
+                # ── 判定续期是否真的生效：看 renewal 有没有变，不看 HTTP 状态。
+                #
+                # run #88 的教训：面板对「还没到续期窗口」的请求照样回
+                # HTTP 200，但 renewal 一动不动（读出来前后都是
+                # 2026-10-02T05:39:58Z）。原来这里 `any(status in
+                # (200,201,204,202))` 就宣布成功，于是每一轮都报
+                # 「✅ 成功续期」而实际什么都没发生。
+                #
+                # renewal 变了 = 真的续上；读到了但没变 = 面板认为还没到
+                # 窗口（no-op），按 skipped 报「状态良好」才是诚实的；
+                # 读不到 = 无法确认，算失败让人来看。
+                _snapshot_cookies("续期后")
+                changed, new_renewal = _verify_renewed(tries=2)
+                log.info("续期后 renewal: %r (点击前: %r)", new_renewal, baseline_renewal)
                 if captured_renew_responses:
                     log.info("📥 拦截到 %d 个 renew 响应, 详情:", len(captured_renew_responses))
                     for i, r in enumerate(captured_renew_responses):
                         log.info("  [%d] HTTP %s body=%s", i, r["status"], r["body"][:200])
-                    # 任一 200/201/204 = 续期成功
-                    if any(r["status"] in (200, 201, 204, 202) for r in captured_renew_responses):
-                        # 打印页面 JS 用的 headers, 帮我下次复现正确路径
-                        for i, req in enumerate(captured_renew_requests):
-                            log.info("  [REQ %d] url=%s headers=%s post_data=%s",
-                                     i, req["url"], mask_headers(req["headers"]), req["post_data"])
-                        browser.close()
-                        log.info("✅ 续期成功 (页面 JS 触发的 renew 请求成功)")
-                        return "renewed"
-
-                # 验证续期是否真的生效: 重新查询 renewal, 与点击前对比
-                new_renewal = query_renewal_field(cookies=cookies, page=page)
-                log.info("续期后 renewal: %r (点击前: %r)", new_renewal, baseline_renewal)
+                    for i, req in enumerate(captured_renew_requests):
+                        log.info("  [REQ %d] url=%s headers=%s post_data=%s",
+                                 i, req["url"], mask_headers(req["headers"]), req["post_data"])
                 browser.close()
-                if new_renewal and new_renewal != baseline_renewal:
-                    log.info("✅ 续期确认成功: renewal 已更新")
+
+                if changed:
+                    log.info("✅ 续期确认成功: renewal 已更新 %s -> %s",
+                             baseline_renewal, new_renewal)
                     return "renewed"
-                log.error("❌ 续期失败: 点击后 renewal 未变化, 续期未生效")
+                if new_renewal:
+                    log.info("⏭️ renewal 未变化（面板回了 %s 但窗口没延长）"
+                             "—— 视为还没到续期窗口，按「状态良好」报",
+                             [r["status"] for r in captured_renew_responses] or "无响应")
+                    return "skipped"
+                if any(r["status"] in (200, 201, 204, 202) for r in captured_renew_responses):
+                    log.warning("⚠️ 读不到 renewal，无法确认；只能按 HTTP 状态判成功（旧行为）")
+                    return "renewed"
+                log.error("❌ 续期失败: 点击后读不到 renewal 且没有成功响应")
                 return "failed"
             else:
                 log.info("页面中未找到 Renew 按钮 - 需要手动检查页面")

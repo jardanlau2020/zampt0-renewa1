@@ -717,10 +717,22 @@ def group_c() -> None:
           '[页内读数] 剩余 %dh' in APP_SRC and 'return "skipped"' in APP_SRC)
     check("C29m main 优先用页内读数算到期",
           'expire_at, hours, human = _PAGE_STATE["expiry"]' in APP_SRC)
-    check("C29n 续期后在页内重试取新 renewal",
-          "[页内读数] 尝试 %d: renewal=%s (age=%.0fs)" in APP_SRC)
+    check("C29n 有 _verify_renewed（以 renewal 变化为准）",
+          "def _verify_renewed(*, tries=1, sleep_ms=3000)" in CODE)
     check("C29o requests 查询降级为兜底（传浏览器 cookie）",
           '_query_expiry(\n                _PAGE_STATE["cookies"] or cookies,' in APP_SRC)
+    # run #88 的真 bug：只看 HTTP 200 就宣布「续期成功」，而面板对 no-op
+    # 也回 200。现在必须以 renewal 是否变化为准。
+    check("C29p 旧的「任一 200 即成功」判定已删除",
+          "任一 200/201/204 = 续期成功" not in APP_SRC)
+    check("C29q renewal 未变化 -> 报 skipped（不再假报成功）",
+          "renewal 未变化" in APP_SRC and APP_SRC.count('return "skipped"') >= 3)
+    check("C29r baseline 取自页内读数",
+          "baseline_renewal = raw_in_page" in APP_SRC)
+    check("C29s 读不到 renewal 时才退回 HTTP 状态判定",
+          "只能按 HTTP 状态判成功（旧行为）" in APP_SRC)
+    check("C29t fetch 路径也走 renewal 变化判定",
+          "changed, new_renewal = _verify_renewed(tries=3)" in APP_SRC)
 
     # ---- workflow
     check("C30 workflow 引用 renew-kit composite action",
