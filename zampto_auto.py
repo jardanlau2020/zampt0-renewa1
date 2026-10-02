@@ -294,6 +294,13 @@ def get_api_session():
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept": "application/json, text/javascript, */*; q=0.01",
         "X-Requested-With": "XMLHttpRequest",
+        # Laravel Sanctum 的 EnsureFrontendRequestsAreStateful 靠 Referer / Origin
+        # 判断「这是不是同源 SPA 发来的请求」。两个头都没有时，它把请求当无状态，
+        # 直接无视 session cookie → /api/* 回 401 {"error":"Unauthorized"}。
+        # run #85 的 [DIAG precheck] 就是这个：cookie 明明有效（浏览器能正常
+        # 加载面板），但 requests 打 /api/servers 一律 401。
+        "Referer": f"{DASHBOARD_URL}/",
+        "Origin": DASHBOARD_URL,
     })
     # Auto-pick up proxy from env (set by workflow when TUIC is active)
     proxy_url = env.get("ALL_PROXY") or env.get("HTTPS_PROXY") or env.get("HTTP_PROXY")

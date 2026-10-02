@@ -645,6 +645,13 @@ def group_c() -> None:
           'if isinstance(s, dict) and str(s.get("id")) == str(SERVER_ID)), None)' in APP_SRC)
     check("C29 预检查同样有 sv is None 分支",
           '_diag_servers_payload(r, "precheck")' in APP_SRC)
+    # run #85 的诊断给出真因：/api/servers 回 401 Unauthorized。
+    # cookie 有效（浏览器能加载面板），所以是请求形状问题 —— Sanctum 的
+    # EnsureFrontendRequestsAreStateful 要 Referer/Origin 才认 session。
+    check("C29a API session 带 Referer", '"Referer": f"{DASHBOARD_URL}/"' in APP_SRC)
+    check("C29b API session 带 Origin", '"Origin": DASHBOARD_URL' in APP_SRC)
+    check("C29c 注释写清了 401 的原因", "EnsureFrontendRequestsAreStateful" in APP_SRC)
+    check("C29d 注释引用了 run #85 的证据", "[DIAG precheck]" in APP_SRC)
 
     # ---- workflow
     check("C30 workflow 引用 renew-kit composite action",
