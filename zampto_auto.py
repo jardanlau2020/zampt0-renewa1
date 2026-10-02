@@ -985,24 +985,31 @@ def phase_browser_renewal(cookies=None):
         sync_cookies_to_session(api, cookies)
         r = api.get(f"{DASHBOARD_URL}/api/servers", timeout=10)
         if r.status_code == 200:
-            for sv in (r.json().get("servers") or []):
-                if str(sv.get("id")) == str(SERVER_ID):
-                    exp_raw = sv.get("renewal", "")
-                    baseline_renewal = exp_raw or None
-                    if not exp_raw:
-                        # 同上：字段读不到 = 剩余时间闸门形同虚设，会无条件续期。
-                        log.warning("  预检查读不到 renewal；该服务器 keys=%s",
-                                    sorted(sv.keys()))
-                    if exp_raw:
-                        from datetime import datetime as dt_cls, timedelta
-                        dt_ob = dt_cls.fromisoformat(exp_raw.replace("Z", "+00:00"))
-                        expires_at = dt_ob + timedelta(hours=48)
-                        rem_h = (expires_at - datetime.now(timezone.utc)).total_seconds() / 3600
-                        if not FORCE_RENEW and rem_h > RENEW_THRESHOLD_HOURS:
-                            log.info("剩余 %.0fh (>%dh), 跳过续期", rem_h, RENEW_THRESHOLD_HOURS)
-                            return "skipped"
-                        if FORCE_RENEW:
-                            log.info("剩余 %.0fh, FORCE_RENEW=true 强制续期", rem_h)
+            data = r.json() or {}
+            sv = next((s for s in (data.get("servers") or [])
+                       if isinstance(s, dict) and str(s.get("id")) == str(SERVER_ID)), None)
+            if sv is None:
+                # 列表空 / id 对不上 —— 闸门同样失效，但原来这里是静默的。
+                _diag_servers_payload(r, "precheck")
+            else:
+                exp_raw = sv.get("renewal", "")
+                baseline_renewal = exp_raw or None
+                if not exp_raw:
+                    # 同上：字段读不到 = 剩余时间闸门形同虚设，会无条件续期。
+                    log.warning("  预检查读不到 renewal；该服务器 keys=%s", sorted(sv.keys()))
+                    _diag_servers_payload(r, "precheck")
+                else:
+                    from datetime import datetime as dt_cls, timedelta
+                    dt_ob = dt_cls.fromisoformat(exp_raw.replace("Z", "+00:00"))
+                    expires_at = dt_ob + timedelta(hours=48)
+                    rem_h = (expires_at - datetime.now(timezone.utc)).total_seconds() / 3600
+                    if not FORCE_RENEW and rem_h > RENEW_THRESHOLD_HOURS:
+                        log.info("剩余 %.0fh (>%dh), 跳过续期", rem_h, RENEW_THRESHOLD_HOURS)
+                        return "skipped"
+                    if FORCE_RENEW:
+                        log.info("剩余 %.0fh, FORCE_RENEW=true 强制续期", rem_h)
+        else:
+            _diag_servers_payload(r, "precheck")
     except Exception as e:
         log.warning("预检查剩余时间失败(可能被CF拦截): %s", e)
     log.info("续期前 renewal: %r", baseline_renewal)
@@ -1853,6 +1860,55 @@ def _fmt_remaining(expire_at) -> str:
     return " ".join(parts)
 
 
+def _mask_id(v):
+    """服务器 id 只露头尾两位，诊断日志里不用整串。"""
+    s = str(v or "")
+    if len(s) <= 4:
+        return "*" * len(s)
+    return s[:2] + "*" * (len(s) - 4) + s[-2:]
+
+
+def _diag_servers_payload(resp, tag, *, limit=400):
+    """`/api/servers` 读不懂时，把「结构」打出来定位字段名。
+
+    只打 key 名、id、条数和「像时间」的值前 40 字；其余值只打类型名，
+    免得把 token / cookie 之类灌进日志。
+
+    为什么放在响应层而不是「id 匹配成功之后」：run #84 的教训 —— 原来的
+    诊断写在 `if sv["id"] == SERVER_ID` 里面，而实际失败原因正是
+    「servers 为空 / id 对不上」，循环体压根没进去，诊断一次都没触发。
+    """
+    try:
+        body = resp.text[:limit]
+    except Exception:
+        body = "<读不到 body>"
+    log.warning("  [DIAG %s] HTTP %s body[:%d]=%s", tag, resp.status_code, limit, body)
+    try:
+        data = resp.json()
+    except Exception as e:
+        log.warning("  [DIAG %s] 不是 JSON: %s", tag, e)
+        return
+    if not isinstance(data, dict):
+        log.warning("  [DIAG %s] 顶层是 %s，不是 dict", tag, type(data).__name__)
+        return
+    log.warning("  [DIAG %s] 顶层 keys=%s", tag, sorted(data.keys()))
+    srv = data.get("servers")
+    if not isinstance(srv, list):
+        log.warning("  [DIAG %s] servers 字段是 %s", tag, type(srv).__name__)
+        return
+    log.warning("  [DIAG %s] servers 共 %d 条，SERVER_ID=%s", tag, len(srv), _mask_id(SERVER_ID))
+    for sv in srv[:3]:
+        if not isinstance(sv, dict):
+            continue
+        log.warning("  [DIAG %s] id=%s keys=%s", tag, _mask_id(sv.get("id")), sorted(sv.keys()))
+        guess = {
+            k: (str(v)[:40] if re.search(r"renew|expir|date|due|end|valid|until|left", k, re.I)
+                else f"<{type(v).__name__}>")
+            for k, v in sv.items()
+        }
+        log.warning("  [DIAG %s] 疑似时间字段: %s", tag, guess)
+
+
 def _query_expiry(cookies, *, wait_for_fresh: bool) -> tuple:
     """查面板 renewal，返回 (到期 ISO, 剩余小时, 人话字符串)。
 
@@ -1867,41 +1923,41 @@ def _query_expiry(cookies, *, wait_for_fresh: bool) -> tuple:
             sync_cookies_to_session(api, cookies)
             r = api.get(f"{DASHBOARD_URL}/api/servers", timeout=10)
             if r.status_code != 200:
+                if attempt == 0:
+                    _diag_servers_payload(r, "query_expiry")
                 continue
-            for sv in (r.json().get("servers") or []):
-                if str(sv.get("id")) != str(SERVER_ID):
-                    continue
-                raw = sv.get("renewal", "")
-                if not raw:
-                    # 面板字段改名了的话，这里会一直查不到 → 续期闸门失效、
-                    # 每轮都真续一次（run #83 就是这么发生的）。把真实 key
-                    # 打出来，下一轮日志就能直接告诉我们该读哪个字段。
-                    # 只打字段名和「像时间」的值，其余只打类型，避免泄密。
-                    if attempt == 0:
-                        log.warning("  /api/servers 缺 renewal 字段；该服务器 keys=%s",
-                                    sorted(sv.keys()))
-                        guess = {
-                            k: (str(v)[:40] if re.search(
-                                r"renew|expir|date|due|end|valid|until|left", k, re.I)
-                                else f"<{type(v).__name__}>")
-                            for k, v in sv.items()
-                        }
-                        log.warning("  疑似时间字段: %s", guess)
-                    break
-                expire_at, hours = renewal_to_expiry(raw)
-                if wait_for_fresh:
-                    try:
-                        age = (datetime.now(timezone.utc)
-                               - datetime.fromisoformat(raw.replace("Z", "+00:00"))
-                               ).total_seconds()
-                    except Exception:
-                        age = 0.0
-                    log.info("  尝试 %d: renewal=%s (age=%.0fs)", attempt + 1, raw, age)
-                    if age > 60:
-                        continue       # 服务器还没更新，再等
-                human = _fmt_remaining(expire_at)
-                log.info("  ✓ 到期时间: %s（%s）", expire_at, human)
-                return expire_at, hours, human
+            data = r.json() or {}
+            sv = next((s for s in (data.get("servers") or [])
+                       if isinstance(s, dict) and str(s.get("id")) == str(SERVER_ID)), None)
+            if sv is None:
+                # 列表空、或 id 对不上 —— 这两种情况原来完全静默（诊断写在
+                # id 匹配之后，永远进不去），run #84 就是这么白跑一趟的。
+                if attempt == 0:
+                    _diag_servers_payload(r, "query_expiry")
+                break
+            raw = sv.get("renewal", "")
+            if not raw:
+                # 面板字段改名了的话，这里会一直查不到 → 续期闸门失效、
+                # 每轮都真续一次（run #83 就是这么发生的）。把真实 key
+                # 打出来，下一轮日志就能直接告诉我们该读哪个字段。
+                if attempt == 0:
+                    log.warning("  renewal 字段存在但为空；该服务器 keys=%s", sorted(sv.keys()))
+                    _diag_servers_payload(r, "query_expiry")
+                break
+            expire_at, hours = renewal_to_expiry(raw)
+            if wait_for_fresh:
+                try:
+                    age = (datetime.now(timezone.utc)
+                           - datetime.fromisoformat(raw.replace("Z", "+00:00"))
+                           ).total_seconds()
+                except Exception:
+                    age = 0.0
+                log.info("  尝试 %d: renewal=%s (age=%.0fs)", attempt + 1, raw, age)
+                if age > 60:
+                    continue       # 服务器还没更新，再等
+            human = _fmt_remaining(expire_at)
+            log.info("  ✓ 到期时间: %s（%s）", expire_at, human)
+            return expire_at, hours, human
         except Exception as e:
             log.warning("  查询 renewal 失败 (尝试 %d): %s", attempt + 1, e)
     log.warning("⚠️ 查不到 renewal 字段，报告里不带到期时间")

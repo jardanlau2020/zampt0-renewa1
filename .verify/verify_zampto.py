@@ -139,6 +139,28 @@ def stdout():
         yield buf
 
 
+@contextlib.contextmanager
+def logs():
+    """抓 zampto logger 的输出。
+
+    `_diag_servers_payload` 走 log.warning 而不是 print，所以 redirect_stdout
+    抓不到 —— 得挂一个 handler 到 "zampto" 这个 logger 上。
+    """
+    import logging as _logging
+    buf = io.StringIO()
+    handler = _logging.StreamHandler(buf)
+    handler.setFormatter(_logging.Formatter("%(message)s"))
+    logger = _logging.getLogger("zampto")
+    old_level = logger.level
+    logger.addHandler(handler)
+    logger.setLevel(_logging.DEBUG)
+    try:
+        yield buf
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(old_level)
+
+
 def fresh_app(**envs):
     """按给定环境重新导入 zampto_auto。
 
@@ -334,6 +356,50 @@ def group_a() -> None:
     txt2 = app._human_summary(rep2, app.Outcome.FAILED, None)
     check("A37 _human_summary 状态 stopped 说人话", "已停止" in txt2)
     check("A38 _human_summary captcha 时提示手动续期", "请手动续期" in txt2)
+
+    # ---- _diag_servers_payload：诊断函数自己不能炸
+    # 它在 _query_expiry / precheck 的 except 路径附近被调用，一旦抛异常
+    # 会把「字段读不到」变成「诊断也挂了」，更难查。
+    class _FakeResp:
+        def __init__(self, code, text, payload=None):
+            self.status_code, self.text, self._p = code, text, payload
+
+        def json(self):
+            if self._p is _BAD_JSON:
+                raise ValueError("not json")
+            return self._p
+
+    _BAD_JSON = object()
+    eq("A39 _mask_id 短 id 全打星", app._mask_id("1234"), "****")
+    eq("A40 _mask_id 长 id 只留头尾", app._mask_id("15629"), "15*29")
+    eq("A41 _mask_id 空值 -> 空串", app._mask_id(None), "")
+
+    cases = [
+        ("A42 非 200 也打状态码", _FakeResp(403, '{"error":"Access blocked"}', {"error": "x"})),
+        ("A43 非 JSON body", _FakeResp(200, "<html>cf</html>", _BAD_JSON)),
+        ("A44 顶层不是 dict", _FakeResp(200, "[1,2]", [1, 2])),
+        ("A45 没有 servers 字段", _FakeResp(200, '{"ok":true}', {"ok": True})),
+        ("A46 servers 不是 list", _FakeResp(200, '{"servers":{}}', {"servers": {}})),
+        ("A47 servers 空列表", _FakeResp(200, '{"servers":[]}', {"servers": []})),
+        ("A48 servers 里有非 dict 元素", _FakeResp(200, '{"servers":[1]}', {"servers": [1]})),
+        ("A49 正常一条", _FakeResp(200, '{"servers":[{"id":1,"renewal":"x"}]}',
+                                   {"servers": [{"id": 1, "renewal": "2026-01-01T00:00:00Z",
+                                                 "cookie": "SECRET"}]})),
+    ]
+    for label, resp in cases:
+        with logs():
+            try:
+                app._diag_servers_payload(resp, "selftest")
+                ok, err = True, ""
+            except BaseException as e:                       # noqa: BLE001
+                ok, err = False, repr(e)
+        check(f"{label} 不抛异常", ok, err)
+    # 敏感值不能原样进日志
+    with logs() as buf:
+        app._diag_servers_payload(cases[-1][1], "selftest")
+    out = buf.getvalue()
+    check("A50 诊断不把 cookie 值打进日志", "SECRET" not in out, out[-200:])
+    check("A51 诊断打出了 keys", "keys=" in out, out[-200:])
 
 
 # ═══════════════════════════════════════════════════════════ [B] 场景矩阵
@@ -561,13 +627,24 @@ def group_c() -> None:
     check("C23 风控信号含 vpn or proxy detected",
           "vpn or proxy detected" in APP_SRC.lower())
     # run #83 发现：面板 /api/servers 读不到 renewal → 剩余时间闸门失效 →
-    # 每 8 小时都会真续一次。留了诊断日志，下一轮就能看到真实字段名。
-    check("C24 _query_expiry 缺字段时打 keys 诊断",
-          "缺 renewal 字段；该服务器 keys=" in APP_SRC)
-    check("C25 浏览器预检查也打 keys 诊断",
-          "预检查读不到 renewal；该服务器 keys=" in APP_SRC)
-    check("C26 诊断只打字段名/时间值，不打整对象",
-          "f\"<{type(v).__name__}>\"" in APP_SRC)
+    # 每 8 小时都会真续一次。run #84 又发现诊断位置写错了（写在 id 匹配
+    # 成功之后，而失败原因恰恰是 id 对不上 / 列表为空 → 一次都没触发）。
+    # 所以诊断必须挂在「响应层」，且两个调用点都要有。
+    check("C24 有 _diag_servers_payload 响应层诊断",
+          "def _diag_servers_payload(resp, tag" in CODE)
+    check("C25 诊断两个调用点都有 tag",
+          '_diag_servers_payload(r, "query_expiry")' in APP_SRC
+          and '_diag_servers_payload(r, "precheck")' in APP_SRC)
+    eq("C25b 诊断共 6 处调用（query_expiry 3 + precheck 3）",
+       CODE.count("_diag_servers_payload(r,"), 6)
+    check("C26 诊断只打 key 名/类型，不打整对象",
+          'f"<{type(v).__name__}>"' in APP_SRC)
+    check("C27 诊断里有 _mask_id 收口 id",
+          "def _mask_id(v)" in CODE and "_mask_id(sv.get(\"id\"))" in APP_SRC)
+    check("C28 _query_expiry 用 next(...) 定位服务器（不再静默跳过）",
+          'if isinstance(s, dict) and str(s.get("id")) == str(SERVER_ID)), None)' in APP_SRC)
+    check("C29 预检查同样有 sv is None 分支",
+          '_diag_servers_payload(r, "precheck")' in APP_SRC)
 
     # ---- workflow
     check("C30 workflow 引用 renew-kit composite action",
