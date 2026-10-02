@@ -766,6 +766,12 @@ def group_c() -> None:
     check("C50 历史背景注释保留", "2026-09-28" in WF_SRC)
     check("C51 不引用已删除的 secrets_chunks.json 作数据源",
           "open(\".github/secrets_chunks.json\")" not in WF_SRC)
+    # run #88/#89 的实测结论：窗口固定 48h、刚续完剩约 45h，阈值 48 时
+    # 闸门永远不跳。默认改成 24。
+    check("C52 阈值默认 24（不是 48）",
+          'env.get_int("RENEW_THRESHOLD_HOURS", 24)' in APP_SRC)
+    check("C53 阈值改动有注释说明依据",
+          "阈值取 48 时" in APP_SRC and "45 > 48" in APP_SRC)
 
     # ---- scripts
     check("C60 setup_proxy.sh 存在", SETUP_PROXY.exists())
@@ -825,6 +831,13 @@ def group_c() -> None:
             check(f"C80 README 记录 {name}", name in rd)
         check("C81 README 提到 renew-kit", "renew-kit" in rd)
         check("C82 README 有结果分类表", "续期未完成" in rd or "failed" in rd.lower())
+        # run #87/#88/#89 的实测结论必须写进 README，否则下一个人会重新踩
+        check("C85 README 说明到期取自页内读数", "页内读数" in rd and "/api/servers" in rd)
+        check("C86 README 记录 renewal 比 UTC 慢约 2h", "2 小时" in rd or "2:00:08" in rd)
+        check("C87 README 说明阈值默认 24", "RENEW_THRESHOLD_HOURS" in rd and "24" in rd)
+        check("C88 README 说明「看 renewal 变没变」判成功",
+              "_verify_renewed" in rd)
+        check("C89 README 提醒 requests 侧会 401", "401" in rd)
     gi = ROOT / ".gitignore"
     if gi.exists():
         g = gi.read_text(encoding="utf-8")
@@ -867,8 +880,12 @@ def group_d() -> None:
          "import zampto_auto as a; print(a.SERVICE, a.RENEW_THRESHOLD_HOURS)"],
         cwd=str(ROOT), env=env, text=True, capture_output=True, timeout=180)
     check("D3  真子进程能 import 模块", r.returncode == 0, r.stderr[-400:])
-    check("D4  import 输出 SERVICE 与阈值",
-          "Zampto 48" in r.stdout, r.stdout.strip()[:120])
+    # 阈值 48 -> 24（2026-10-02，窗口固定 48h + 面板 renewal 慢 2h，读数常落在
+    # 45-46h，阈值 48 时闸门永远不跳）。这里拆成两步断言：服务名钉死，阈值单独
+    # 钉死，改默认值时一眼看得出是哪一条动了。
+    _svc, _, _thr = r.stdout.strip().partition(" ")
+    eq("D4  import 输出的 SERVICE 名", _svc, "Zampto")
+    eq("D4b 续期阈值默认 24h", _thr.strip(), "24")
 
     # D5 缺凭据时 main() 退 1（端到端，含 renewkit 渲染）
     r = subprocess.run(

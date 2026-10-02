@@ -16,15 +16,63 @@ Zampto Minecraft 面板的自动续期：每 8 小时检查一次，剩余时间
 2. 注入会话      ZAMPTO_SESSION_SECRET（session.json 的 base64）解出 cookies
 3. 浏览器续期    Playwright 打开面板 → 必要时过 Turnstile → 点 Renew
                  由页面 JS 发请求，自动携带正确的 CSRF
-4. 兜底 API 路径 浏览器没成时，用 requests 直接打 /api/server/renew
+4. 页内读到期    在页面上下文里 fetch /api/servers 拿 renewal（页面已鉴权，
+                 必然读得到）；顺带判「要不要续」和「续上没续上」
+5. 兜底 API 路径 浏览器没成时，用 requests 直接打 /api/server/renew
                  （CSRF 三种编码形态 × 两种 header 逐一试）
-5. 复核到期时间   重新查 renewal 字段，算「上次续期 + 48h」
 6. 出报告        classify() -> Outcome -> RenewReport.finish()（打印 + 发 TG + 退出码）
 ```
 
-**Zampto 的 `renewal` 字段是「上次续期时间」，不是到期时间** —— 到期 = renewal + 48h。
-直接拿它当到期时间会渲染出一个已经过去的日期，这是这个面板最容易踩的字段语义坑，
+### `renewal` 字段：语义与两个坑
+
+**`renewal` 是「本次 48h 窗口的起点」，不是到期时间** —— 到期 = renewal + 48h。
+直接拿它当到期时间会渲染出一个已经过去的日期，这是这个面板最容易踩的坑，
 现在集中收在 `renewal_to_expiry()` 里算一次。
+
+实测确认的两件事（run #88 / #89）：
+
+- **面板的 `renewal` 比真实 UTC 慢约 2 小时。** 点击发生在 07:52:5x，
+  写回的却是 `2026-10-02T05:52:51.000Z`，差 2:00:08。所以
+  `到期 = renewal + 48h` 比真实到期早约 2h —— **保守方向**，无害，
+  但报告里的「到期」会比面板上显示的早两小时，别以为是 bug。
+- **`renewal` 每次续期都会推进**（05:47:09 → 05:52:51），
+  所以它可以当「这次到底续上没有」的判据。
+
+### 到期时间从哪来：页内读数，不是 requests
+
+`GET /api/servers` 在**页面上下文里**回 200 且带着完整服务器对象；同一个
+URL 用我们手写的 `requests` 打，**一律 401 `{"error":"Unauthorized"}`**。
+差别在 cookie 集合：`ZAMPTO_SESSION_SECRET` 里只有 `zampto_session`，
+`XSRF-TOKEN` 是页面加载后由服务端下发的，secret 里没有它，而 API 守卫要。
+
+所以（run #87 页内探测定论之后）：
+
+- **主路径**：`read_renewal_in_page()` —— 在页面里 `fetch`，用浏览器
+  已经建立好的鉴权。`_PAGE_STATE` 保存快照 cookie 与读到的时间。
+- **兜底**：`_query_expiry()` —— requests 查询，只在页面读数失败时用，
+  并把浏览器快照的 cookie 传过去（不再是 secret 里那份）。
+
+### 怎么判「续期成功」：看 renewal 变没变，不看 HTTP 状态
+
+面板**有可能**对一次没有实际延长窗口的请求回 HTTP 200，所以只看状态码
+是不可靠的。判定统一走 `_verify_renewed()`：
+
+| 情况 | 结论 |
+|---|---|
+| renewal 变了 | `renewed` ✅ 真续上 |
+| 读到了但没变 | `skipped` 🟢 面板认为还没到窗口，按「状态良好」报 |
+| 读不到 + 有 2xx | `renewed` + ⚠️ 日志说明「只能按 HTTP 状态判（旧行为）」 |
+| 读不到 + 无 2xx | `failed` 🚨 |
+
+### `RENEW_THRESHOLD_HOURS` 默认 24（不是 48）
+
+窗口固定 48h，刚续完剩约 45h（还叠了上面那个 2h 偏移）。阈值取 48 时
+`45 > 48` 为假 → 闸门永远不跳，每 8 小时都白点一次 Renew + 过一次
+Turnstile。取 24 表示「过半再续」，即使某次失败也还有 3 个 cron 周期的
+缓冲。想恢复旧行为设 `RENEW_THRESHOLD_HOURS=48`。
+
+注意：闸门需要页面才能读数，所以**每轮仍会起浏览器**；阈值省掉的是
+点击和 Turnstile，不是运行时长。
 
 ---
 
@@ -34,10 +82,11 @@ Zampto Minecraft 面板的自动续期：每 8 小时检查一次，剩余时间
 
 | Outcome | 触发条件 | 渲染 | 退出码 |
 |---|---|---|---|
-| `renewed` | 续期成功 | ✅ 成功续期至 … | 0 |
+| `renewed` | renewal 确实推进了 | ✅ 成功续期至 … | 0 |
 | `skipped` | 未到窗口且无错误 | 🟢 状态良好（剩 N 天） | 0 |
 | `transient` | 上游 5xx / 超时 / 连不上 | 🌐 上游暂不可用 | **0（不标红）** |
 | `failed` | 验证码挡路 / CSRF 打不通 / 出口被标记 | 🚨 续期未完成 | 1 |
+
 
 三条容易搞错的地方：
 

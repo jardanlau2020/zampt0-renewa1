@@ -77,8 +77,17 @@ USERNAME = env.get("ZAMPTO_USERNAME")
 PASSWORD = env.get("ZAMPTO_PASSWORD")
 SERVER_ID = env.get("ZAMPTO_SERVER_ID")
 FORCE_RENEW = env.get("FORCE_RENEW").lower() == "true"
-# 续期阈值 (小时): 剩余时间低于此值才续期, 与续期 API 判断保持一致
-RENEW_THRESHOLD_HOURS = env.get_int("RENEW_THRESHOLD_HOURS", 48)
+# 续期阈值 (小时): 剩余时间低于此值才续期, 与续期 API 判断保持一致。
+#
+# 默认值从 48 降到 24（2026-10-02，run #88/#89 的实测数据）：
+# Zampto 的窗口固定是 48h（到期 = renewal + 48h），刚续完剩约 45h，
+# 而面板的 renewal 还比真实 UTC 慢约 2h，所以读数通常落在 45-46h。
+# 阈值取 48 时 `45 > 48` 为假 → 闸门永远不跳，每 8 小时都真点一次
+# Renew + 过一次 Turnstile，纯属白费。
+# 取 24 的含义：剩 24h 以内才续 —— 对 48h 窗口来说是「过半再续」，
+# 即使某次续期失败也还有 3 个 cron 周期的缓冲。
+# 想恢复旧行为就设 RENEW_THRESHOLD_HOURS=48（或更高）。
+RENEW_THRESHOLD_HOURS = env.get_int("RENEW_THRESHOLD_HOURS", 24)
 DASHBOARD_URL = "https://dash.zampto.net"
 SESSION_FILE = "./screenshots/session.json"
 LOG_DIR = "./screenshots"
