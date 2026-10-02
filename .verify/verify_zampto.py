@@ -652,6 +652,14 @@ def group_c() -> None:
     check("C29b API session 带 Origin", '"Origin": DASHBOARD_URL' in APP_SRC)
     check("C29c 注释写清了 401 的原因", "EnsureFrontendRequestsAreStateful" in APP_SRC)
     check("C29d 注释引用了 run #85 的证据", "[DIAG precheck]" in APP_SRC)
+    # run #86 证明 Referer/Origin 不够（仍 401）。改成「以页面为准」观察：
+    # 记下页面自己打的 /api/ 请求，并在页内 fetch 候选端点。
+    check("C29e 有 probe_api_in_page", "def probe_api_in_page(page, paths)" in CODE)
+    check("C29f 页内 fetch 带 credentials include", "credentials: 'include'" in APP_SRC)
+    check("C29g 记录页面自己发的 /api/ 请求", "seen_api.add(" in APP_SRC)
+    check("C29h 页内探测三个候选端点",
+          '"/api/servers",' in APP_SRC and 'f"/api/servers/{SERVER_ID}",' in APP_SRC)
+    check("C29i 诊断打印 [API 观察]", "[API 观察]" in APP_SRC)
 
     # ---- workflow
     check("C30 workflow 引用 renew-kit composite action",

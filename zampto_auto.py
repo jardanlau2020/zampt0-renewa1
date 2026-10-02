@@ -971,6 +971,42 @@ def query_renewal_field(cookies=None, page=None):
     return None
 
 
+def probe_api_in_page(page, paths):
+    """在页面上下文里 fetch 这些路径，打出状态码与 body 前 200 字。
+
+    为什么要「在页面里」打：我们手写的 requests 请求一律 401，而页面自己
+    发的请求是通的。在页面上下文里发同一个请求，就能把两种可能分开 ——
+    端点不存在/需要别的鉴权（页内也 401）vs 我们的客户端请求形状不对
+    （页内 200）。credentials: 'include' 保证带上 session cookie。
+    """
+    js = """
+    async (paths) => {
+      const out = [];
+      for (const p of paths) {
+        try {
+          const r = await fetch(p, {credentials: 'include',
+                                    headers: {'Accept': 'application/json',
+                                              'X-Requested-With': 'XMLHttpRequest'}});
+          let t = '';
+          try { t = (await r.text()).slice(0, 200); } catch (e) { t = '<读不到 body>'; }
+          out.push({path: p, status: r.status, body: t});
+        } catch (e) {
+          out.push({path: p, status: -1, body: String(e).slice(0, 120)});
+        }
+      }
+      return out;
+    }
+    """
+    try:
+        results = page.evaluate(js, paths)
+    except Exception as e:
+        log.warning("  [PROBE] 页内 fetch 执行失败: %s", e)
+        return
+    for r in results or []:
+        log.warning("  [PROBE] %s -> HTTP %s body=%s",
+                    r.get("path"), r.get("status"), (r.get("body") or "")[:200])
+
+
 def phase_browser_renewal(cookies=None):
     """Phase 2: 浏览器自动续期。
     返回: "renewed" / "skipped" / "failed" """
@@ -1076,9 +1112,15 @@ def phase_browser_renewal(cookies=None):
         #   2) 如果请求成功, 我们直接从响应判断是否续期成功, 无需 query_renewal_field
         captured_renew_requests = []
         captured_renew_responses = []
+        # 页面自己发的所有 /api/ 请求（方法 + 路径），用来「以页面为准」发现
+        # 真正读服务器状态的端点 —— 我们手写的 /api/servers 一直是 401，
+        # 与其继续猜，不如看页面自己打哪个。
+        seen_api = set()
         try:
             def _on_request(req):
                 try:
+                    if "/api/" in req.url:
+                        seen_api.add(f"{req.method} {req.url.split(DASHBOARD_URL, 1)[-1].split('?')[0]}")
                     if "/api/server/renew" in req.url and req.method == "POST":
                         captured_renew_requests.append({
                             "url": req.url,
@@ -1134,6 +1176,20 @@ def phase_browser_renewal(cookies=None):
         page.wait_for_timeout(3000)
         snap(page, "03_server_page.png")
         log.info("服务器页加载完成, URL: %s", page.url)
+
+        # 以页面为准：先看页面自己打了哪些 API，再在页内试打候选端点。
+        # 手写的 requests 打 /api/servers 一直 401，但页面的请求是通的 ——
+        # 在页面上下文里发同一个请求，就能区分「端点不对」（页内也 401）
+        # 和「客户端请求形状不对」（页内 200）。
+        if seen_api:
+            log.info("  [API 观察] 页面自己发出的 /api/ 请求: %s", sorted(seen_api))
+        else:
+            log.info("  [API 观察] 页面没发任何 /api/ 请求（可能是服务端渲染）")
+        probe_api_in_page(page, [
+            "/api/servers",
+            f"/api/server?id={SERVER_ID}",
+            f"/api/servers/{SERVER_ID}",
+        ])
 
         # 执行续期
         # 服务端要求 server_id 为整数: 传字符串 "15629" 会直接回 400 "Invalid server ID"
