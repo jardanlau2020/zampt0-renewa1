@@ -184,20 +184,30 @@ fi
 /tmp/sing-box version
 
 # ── 探针: 出口是否被 Zampto 标记 ─────────────────────────────────────────────
-probe_zampto() {   # 用法: probe_zampto [curl 代理参数...]；0=出口干净 1=被标记 2=无响应
-  local body page
-  body=$(curl -s --max-time 20 "$@" -X POST https://dash.zampto.net/api/server/renew \
+# 2026-10-12 修正（假绿）：本探针原本只发**未登入**请求。未登入时 Zampto 一律回
+# HTTP 403 + {"success":false,"message":"Unauthorized"} + 页面 307->/auth/login ——
+# 冇 "Access blocked" 字眼，于是旧逻辑判「出口干净」。实测（run 38276176133/38276484839）：
+# 同一条出口、同一个端点，**带 session cookie** 就变成 403 + 页面 307->/blocked。
+# 即係标记判定只对「已登入请求」生效 —— 未登入 = **无定论**，唔可以当绿。
+# 现在：有 ZAMPTO_SESSION_SECRET 就带 cookie 探（真判据）；无 cookie 则回 3（无定论）。
+probe_zampto() {   # 用法: probe_zampto [curl 代理参数...]；0=干净 1=被标记 2=无响应 3=无定论(未登入)
+  local body page ca=()
+  if [ -n "$AUTH_COOKIE" ]; then ca=(-H "cookie: $AUTH_COOKIE"); else ca=(); fi
+  body=$(curl -s --max-time 20 "$@" "${ca[@]}" -X POST https://dash.zampto.net/api/server/renew \
            -H 'content-type: application/json' -H 'x-requested-with: XMLHttpRequest' \
            --data '{"server_id":1}' 2>/dev/null || true)
-  page=$(curl -s --max-time 20 "$@" -o /dev/null -w '%{redirect_url}' \
+  page=$(curl -s --max-time 20 "$@" "${ca[@]}" -o /dev/null -w '%{redirect_url}' \
            https://dash.zampto.net/ 2>/dev/null || true)
   echo "      探针 API : ${body:0:110}"
-  echo "      探针 页面: ${page:-<无跳转>}"
+  echo "      探针 页面: ${page:-<无跳转>}  [带 cookie: $([ -n "$AUTH_COOKIE" ] && echo yes || echo no)]"
   case "$body $page" in
     *"Access blocked"*|*"/blocked"*) return 1 ;;
   esac
   case "$body" in
     "") return 2 ;;
+  esac
+  case "$body" in
+    *Unauthorized*|*'"success":false'*) return 3 ;;
   esac
   return 0
 }
@@ -223,6 +233,24 @@ start_node() {   # $1 = 节点 URI；起 sing-box 并验证代理本身可通
   return 1
 }
 
+# ── session cookie（探针要带住佢先测得准；矩阵同探针共用）───────────────────
+AUTH_COOKIE=""
+if [ -n "$ZAMPTO_SESSION_SECRET" ]; then
+  AUTH_COOKIE=$(python3 - << 'PYEOF'
+import os, base64, json
+try:
+    d = json.loads(base64.b64decode(os.environ["ZAMPTO_SESSION_SECRET"]).decode())
+    out = []
+    for c in d.get("cookies", []):
+        if isinstance(c, dict) and c.get("name"):
+            out.append(f"{c['name']}={c.get('value','')}")
+    print("; ".join(out))
+except Exception:
+    print("")
+PYEOF
+)
+fi
+
 echo "[3/4] 依次尝试候选出口 (PROXY_URI -> TUIC_URI) ..."
 USE_PROXY=0
 CHOSEN_IP=""
@@ -245,6 +273,12 @@ for cand in "primary" "alt"; do
     break
   elif [ "$probe_rc" = "1" ]; then
     echo "      ✗ 出口被 Zampto 标记 (VPN or proxy detected), 换下一个候选"
+  elif [ "$probe_rc" = "3" ]; then
+    echo "      ⚠️ 探针未登入，**无法判定出口**（标记只对已登入请求生效）—— 沿用本候选，"
+    echo "         最终以登入后的浏览器请求为准（若仍 403 + /blocked，系 session/账号被标记，非出口）"
+    USE_PROXY=1
+    CHOSEN_IP="$EXIT_IP"
+    break
   else
     echo "      ⚠️ 探针无响应（网络层不确定），仍沿用本候选"
     USE_PROXY=1
@@ -258,7 +292,7 @@ if [ "$USE_PROXY" = "1" ]; then
   echo "ALL_PROXY=socks5h://127.0.0.1:1080" >> $GITHUB_ENV
   echo "HTTP_PROXY=socks5h://127.0.0.1:1080" >> $GITHUB_ENV
   echo "HTTPS_PROXY=socks5h://127.0.0.1:1080" >> $GITHUB_ENV
-  echo "[OK] Proxy is ready (Zampto 探针通过, 出口 $CHOSEN_IP)"
+  echo "[OK] Proxy is ready (出口 $CHOSEN_IP; 探针判定见上，未登入则仅供参考)"
 else
   echo "[WARN] 所有代理候选都被标记/不可用, 试直连 (GitHub 出口 IP)..."
   probe_zampto && direct_rc=0 || direct_rc=$?
@@ -267,8 +301,16 @@ else
     echo "PROXY_OK=0" >> $GITHUB_ENV
     CHOSEN_IP="direct"
   else
-    echo "[ERROR] 代理候选与直连都被 Zampto 标记/不可用 — 续期必失败。"
-    echo "        对策: 换一条非 WARP/VPN 段的节点写进 PROXY_URI secret, 或人手去面板续期。"
+    if [ "$probe_rc" = "1" ] && [ "$direct_rc" = "1" ]; then
+      # 2026-10-12: 带 cookie 探针下「代理」与「直连」同时被标记 —— 换出口救唔到。
+      echo "[ERROR] 代理与直连（**带 session cookie**）双双被标记 —— 系 session/账号被站方标记，"
+      echo "        唔系出口 IP 问题：换几多条节点都一样（实测 UAE/SG 两条节点 + 直连三格同结果）。"
+      echo "        对策: 用真人浏览器开 https://dash.zampto.net/ —— 若见到 /blocked 即账号被标记，"
+      echo "              要等站方解封或联系客服；否则请人手撳续期。"
+    else
+      echo "[ERROR] 代理候选与直连都被 Zampto 标记/不可用 — 续期必失败。"
+      echo "        对策: 换一条非 WARP/VPN 段的节点写进 PROXY_URI secret, 或人手去面板续期。"
+    fi
     echo "PROXY_OK=0" >> $GITHUB_ENV
     exit 1
   fi
@@ -277,22 +319,6 @@ fi
 # ── 诊断矩阵（只印 HTTP 状态码，绝不打印响应体 / cookie）─────────────────────
 if [ "${ZAMPTO_DIAG:-1}" = "1" ]; then
   echo "── Zampto 四格诊断矩阵 (状态码; AUTH = 带 session cookie) ──"
-  AUTH_COOKIE=""
-  if [ -n "$ZAMPTO_SESSION_SECRET" ]; then
-    AUTH_COOKIE=$(python3 - << 'PYEOF'
-import os, base64, json
-try:
-    d = json.loads(base64.b64decode(os.environ["ZAMPTO_SESSION_SECRET"]).decode())
-    out = []
-    for c in d.get("cookies", []):
-        if isinstance(c, dict) and c.get("name"):
-            out.append(f"{c['name']}={c.get('value','')}")
-    print("; ".join(out))
-except Exception:
-    print("")
-PYEOF
-)
-  fi
   if [ "$USE_PROXY" = "1" ]; then PROXY_ARGS="--socks5-hostname 127.0.0.1:1080"; else PROXY_ARGS=""; fi
   for mode in proxy direct; do
     [ "$mode" = "proxy" ] && [ "$USE_PROXY" != "1" ] && continue
