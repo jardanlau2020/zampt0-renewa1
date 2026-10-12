@@ -1024,9 +1024,16 @@ def probe_api_in_page(page, paths):
     except Exception as e:
         log.warning("  [PROBE] 页内 fetch 执行失败: %s", e)
         return
+    global _browser_block_hits, _browser_block_sample
     for r in results or []:
         log.warning("  [PROBE] %s -> HTTP %s body=%s",
                     r.get("path"), r.get("status"), (r.get("body") or "")[:200])
+        # 頁內見到 403 + 封鎖字眼 = 出口被站方標記（要換節點），記入 module 計數器
+        body_l = (r.get("body") or "").lower()
+        if r.get("status") == 403 and any(h in body_l for h in BLOCKED_HINTS):
+            _browser_block_hits += 1
+            if not _browser_block_sample:
+                _browser_block_sample = (r.get("body") or "")[:120]
 
 
 def read_renewal_in_page(page, server_id):
@@ -1581,14 +1588,23 @@ def phase_api_renewal(use_cookies=None) -> RenewReport:
 
         if not server_data:
             log.error("Could not find a working API endpoint for server info")
-            log.error("Probed %d paths, none returned 200+JSON (5xx=%d blocked=%d net=%d)",
-                      len(candidate_paths), probe_5xx, probe_blocked, probe_net)
+            log.error("Probed %d paths, none returned 200+JSON "
+                      "(5xx=%d blocked=%d net=%d, 浏览器侧被封=%d)",
+                      len(candidate_paths), probe_5xx, probe_blocked, probe_net,
+                      _browser_block_hits)
             report["error"] = (
                 f"面板 API 全部探测失败（{len(candidate_paths)} 条路径；"
-                f"5xx={probe_5xx} 风控={probe_blocked} 网络={probe_net}）"
+                f"5xx={probe_5xx} 风控={probe_blocked} 网络={probe_net}"
+                + (f"；**瀏覽器側出口被封 {_browser_block_hits} 次**"
+                   f"（{_browser_block_sample[:60]}）→ 要換住宅/運營商節點，唔係上游故障"
+                   if _browser_block_hits else "")
+                + "）"
             )
-            # 全是 5xx / 连不上 -> 上游故障，别标红；有 403 风控 -> 要换节点，算失败
-            report["transient"] = (probe_5xx + probe_net) > 0 and probe_blocked == 0
+            # 全是 5xx / 连不上 -> 上游故障，别标红；
+            # 有 403 风控（requests 側或瀏覽器側）-> 要換節點，算失敗
+            report["transient"] = ((probe_5xx + probe_net) > 0
+                                   and probe_blocked == 0
+                                   and _browser_block_hits == 0)
             return _to_renew_report(report)
 
         log.info("Using endpoint: %s", used_path)
@@ -1916,6 +1932,14 @@ TRANSIENT_HINTS = (
 
 #: 出口被风控挡住的信号。这**不是**上游故障 —— 要换节点，属于人工处理。
 BLOCKED_HINTS = ("vpn or proxy detected", "access blocked", "/blocked")
+
+#: 瀏覽器側（頁內 fetch）觀察到嘅「出口被封」次數。
+# 2026-10-12 加：原本只 requests 側嗰 16 條路徑計數，但被 VPN 封時 requests 側
+# 往往只回 404/401（SPA fallback／session 未生效），真正嘅 403
+# 「Access blocked / VPN or proxy detected」係**瀏覽器側**先見到 →
+# 結果紅單只寫「全部探测失败（风控=0）」＝含糊，睇唔出要換住宅節點。
+_browser_block_hits = 0
+_browser_block_sample = ""
 
 
 def _now_iso() -> str:
