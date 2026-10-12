@@ -303,10 +303,15 @@ else
   else
     if [ "$probe_rc" = "1" ] && [ "$direct_rc" = "1" ]; then
       # 2026-10-12: 带 cookie 探针下「代理」与「直连」同时被标记 —— 换出口救唔到。
-      echo "[ERROR] 代理与直连（**带 session cookie**）双双被标记 —— 系 session/账号被站方标记，"
-      echo "        唔系出口 IP 问题：换几多条节点都一样（实测 UAE/SG 两条节点 + 直连三格同结果）。"
-      echo "        对策: 用真人浏览器开 https://dash.zampto.net/ —— 若见到 /blocked 即账号被标记，"
-      echo "              要等站方解封或联系客服；否则请人手撳续期。"
+      # 2026-10-12 修正：原本写死「系 session/账号被标记」——过度断言。实测 8 条出口
+      # （M247 AE/RO、Akamai-Linode SG、1Cent FI、Luxvps DE、Uphost PL、Azure 直连…）全中，
+      # 而用户用**屋企线**人手撳係成功嘅 ⇒ 账号本身冇被标记。两种解释都仍然成立，照实写。
+      echo "[ERROR] 代理与直连（**带 session cookie**）双双被标记。两种可能："
+      echo "        (a) 所有候选出口都属被封类別（机房 ASN 一律当 VPN）—— 8 条实测全中；"
+      echo "        (b) 存落嘅 session cookie 本身已被标记（脚本会注入佢，故干净出口都可能照样 403）。"
+      echo "        对策: ① 用屋企线真人浏览器登入 → 抓新鲜 cookie 更新 ZAMPTO_SESSION_SECRET 再试；"
+      echo "              ② 仍然 403 + /blocked → 要家宽/住宅出口（机房节点唔使再试）；"
+      echo "              ③ 或直接人手撳 https://dash.zampto.net/（最快，30 秒）。"
     else
       echo "[ERROR] 代理候选与直连都被 Zampto 标记/不可用 — 续期必失败。"
       echo "        对策: 换一条非 WARP/VPN 段的节点写进 PROXY_URI secret, 或人手去面板续期。"
