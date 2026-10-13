@@ -47,6 +47,9 @@ jobs:
       #   —— 當日成功寫入 182 字的 PROXY_URI。之前 422 是用錯 Box 而非 SealedBox。
       PROXY_URI: ${{ secrets.PROXY_URI }}
       TUIC_URI: ${{ secrets.TUIC_URI }}
+      # 2026-10-13 加：cfnew 家宽訂閱（mihomo/Clash YAML）。落地係真住宅寬帶，
+      # 實測 KR/TH 落地 → /api/servers 200（機房節點一律 403）。有咗佢就唔靠 PROXY_URI。
+      ZAMPO_SUB_URL: ${{ secrets.ZAMPO_SUB_URL }}
       ZAMPTO_SESSION_SECRET: ${{ secrets.ZAMPTO_SESSION_SECRET }}
       ZAMPTO_USERNAME: ${{ secrets.ZAMPTO_USERNAME }}
       ZAMPTO_PASSWORD: ${{ secrets.ZAMPTO_PASSWORD }}
@@ -73,12 +76,14 @@ jobs:
               echo "[OK] $name 已配置 (${#val} chars)"
             fi
           done
-          if [ -n "$PROXY_URI" ]; then
+          if [ -n "$ZAMPO_SUB_URL" ]; then
+            echo "[OK] cfnew 家宽订阅已配置 (ZAMPO_SUB_URL, ${#ZAMPO_SUB_URL} chars) —— mihomo 路线"
+          elif [ -n "$PROXY_URI" ]; then
             echo "[OK] 代理节点已配置 (PROXY_URI, ${#PROXY_URI} chars)"
           elif [ -n "$TUIC_URI" ]; then
             echo "[OK] 代理节点已配置 (TUIC_URI 兜底, ${#TUIC_URI} chars)"
           else
-            echo "[ERROR] PROXY_URI / TUIC_URI 都没配！GitHub 裸出口会被 Cloudflare 风控(403)，续期必失败"
+            echo "[ERROR] ZAMPO_SUB_URL / PROXY_URI / TUIC_URI 都没配！GitHub 裸出口会被 Cloudflare 风控(403)，续期必失败"
             missing=1
           fi
           if [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then

@@ -270,6 +270,66 @@ echo "[3/4] 依次尝试候选出口 (PROXY_URI -> TUIC_URI) ..."
 USE_PROXY=0
 CHOSEN_IP=""
 probe_rc=""   # 2026-10-13: 候選連唔通時 loop 直接 continue，probe_rc 從未賦值 → 下面分支會誤判
+
+# ── mihomo 路線（ZAMPO_SUB_URL）：cfnew 家宽訂閱 = CF 前置 → OpenVPN 住宅落地 ──────
+# 2026-10-13 加。背景：Zampto 對機房/VPN 出口一律 403 Access blocked（當日 30 條機房
+# 節點全滅，連 HiNet 家寬 AS3462 都中）。用戶提供 cfnew 家宽訂閱（mihomo/Clash YAML），
+# 落地係真住宅寬帶 —— 實測 KR-家宽-01/02/03、TH-家宽-02 → /api/servers 200 ✅
+# （同一訂閱 JP-家宽 全 403 ⇒ 逐個 IP 信譽，非類別）。sing-box 唔支援 OpenVPN，故用 mihomo。
+# 注意版本：v1.19.25 會報 `proxy 213 has unset fields: tls-crypt`（openvpn 缺欄位），v1.19.26 正常。
+MIHOMO_VER="${MIHOMO_VER:-v1.19.26}"
+MIHOMO_TRIES="${MIHOMO_TRIES:-10}"
+if [ "$USE_PROXY" != "1" ] && [ -n "${ZAMPO_SUB_URL:-}" ]; then
+  echo "[2.5/4] mihomo 路線：cfnew 家宽訂閱 ..."
+  if curl -sL --max-time 120 -o /tmp/mihomo.gz \
+       "https://github.com/MetaCubeX/mihomo/releases/download/${MIHOMO_VER}/mihomo-linux-amd64-${MIHOMO_VER}.gz" \
+     && gzip -dc /tmp/mihomo.gz > /tmp/mihomo 2>/dev/null && chmod +x /tmp/mihomo; then
+    echo "      ✅ mihomo $(/tmp/mihomo -v 2>&1 | head -1)"
+    if curl -s --max-time 60 -H "user-agent: v2rayNG/1.8.5" "$ZAMPO_SUB_URL" -o /tmp/sub.yaml && [ -s /tmp/sub.yaml ]; then
+      sed -i 's/^mixed-port: .*/mixed-port: 1080/; s/^external-controller: .*/external-controller: 127.0.0.1:9090/; s/^mode: .*/mode: global/' /tmp/sub.yaml
+      nohup /tmp/mihomo -f /tmp/sub.yaml -d /tmp/mihomo_data > /tmp/mihomo.log 2>&1 &
+      sleep 18
+      if curl -s --max-time 10 http://127.0.0.1:9090/version >/dev/null 2>&1; then
+        echo "      ✅ mihomo 起動（mode=global, mixed-port 1080）"
+        python3 - <<'MIHOMO_PY' > /tmp/home_nodes.txt 2>/dev/null
+import json, urllib.request
+d = json.load(urllib.request.urlopen("http://127.0.0.1:9090/proxies", timeout=20))["proxies"]
+for k in d:
+    if "家宽" in k:
+        print(k)
+MIHOMO_PY
+        TOTAL=$(wc -l < /tmp/home_nodes.txt | tr -d ' ')
+        echo "      家宽落地 ${TOTAL} 條，逐條試（最多 ${MIHOMO_TRIES} 條）"
+        N=0
+        while IFS= read -r NODE; do
+          [ -z "$NODE" ] && continue
+          N=$((N+1)); [ "$N" -gt "$MIHOMO_TRIES" ] && break
+          python3 - "$NODE" <<'MIHOMO_PY' 2>/dev/null || continue
+import json, urllib.request, sys
+req = urllib.request.Request("http://127.0.0.1:9090/proxies/GLOBAL", method="PUT",
+      data=json.dumps({"name": sys.argv[1]}).encode(),
+      headers={"content-type": "application/json"})
+urllib.request.urlopen(req, timeout=15)
+MIHOMO_PY
+          sleep 5
+          if probe_zampto --socks5-hostname 127.0.0.1:1080; then
+            echo "      ✅ 揀到乾淨住宅落地：${NODE}"
+            USE_PROXY=1; CHOSEN_IP="mihomo:${NODE}"; break
+          fi
+          echo "      ✗ ${NODE} 唔過（換下一條）"
+        done < /tmp/home_nodes.txt
+      else
+        echo "      ✗ mihomo 起唔到，log 尾："; tail -3 /tmp/mihomo.log 2>/dev/null
+      fi
+    else
+      echo "      ✗ 訂閱下載失敗"
+    fi
+  else
+    echo "      ✗ mihomo 下載失敗"
+  fi
+fi
+
+if [ "$USE_PROXY" != "1" ]; then
 for cand in "primary" "alt"; do
   if [ "$cand" = "primary" ]; then URI="$PROXY_URI"; else URI="$TUIC_URI"; fi
   [ -n "$URI" ] || continue
@@ -302,6 +362,7 @@ for cand in "primary" "alt"; do
     break
   fi
 done
+fi
 
 if [ "$USE_PROXY" = "1" ]; then
   echo "PROXY_OK=1" >> $GITHUB_ENV
