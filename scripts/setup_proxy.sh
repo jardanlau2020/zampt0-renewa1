@@ -43,11 +43,20 @@ if not link:
     sys.exit(1)
 
 proto = "hysteria2"
-for prefix in ["hysteria2://", "hy2://", "tuic://", "vless://", "vmess://"]:
-    if link.startswith(prefix):
-        link = link[len(prefix):]
-        proto = {"tuic://": "tuic", "vless://": "vless", "vmess://": "vmess"}.get(prefix, "hysteria2")
-        break
+# 2026-10-13: 原本清單冇 trojan:// —— trojan 連結會**靜默**跌入 hysteria2 分支，
+# password 變成 "trojan://<uuid>"，代理連唔通，令人誤以為係節點問題（實測 KR 兩條中招）。
+# 同時加未知協議守衛：認唔到就報錯，唔准再靜默猜。
+_SUPPORTED = {
+    "hysteria2://": "hysteria2", "hy2://": "hysteria2",
+    "tuic://": "tuic", "vless://": "vless", "vmess://": "vmess",
+    "trojan://": "trojan", "trojan-go://": "trojan",
+}
+_scheme = link.split("://", 1)[0] + "://" if "://" in link else ""
+if _scheme not in _SUPPORTED:
+    sys.stderr.write("不支援嘅節點協議: %r（支援: %s）\n" % (_scheme, ", ".join(_SUPPORTED)))
+    sys.exit(1)
+proto = _SUPPORTED[_scheme]
+link = link[len(_scheme):]
 link = link.split("#", 1)[0]
 if "?" in link:
     main, query = link.split("?", 1)
@@ -113,7 +122,7 @@ else:
             out["uuid"], out["password"] = password.split(":", 1)
         else:
             out["uuid"] = password
-    else:  # hysteria2 / hy2
+    else:  # hysteria2 / hy2 / trojan（trojan 嘅 userinfo 就係密碼，冇 uuid）
         out["password"] = password
     out["tls"] = {"enabled": True, "server_name": sni or server, "insecure": insecure}
     if alpn:
