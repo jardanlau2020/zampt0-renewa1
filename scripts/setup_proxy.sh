@@ -278,7 +278,7 @@ probe_rc=""   # 2026-10-13: 候選連唔通時 loop 直接 continue，probe_rc �
 # （同一訂閱 JP-家宽 全 403 ⇒ 逐個 IP 信譽，非類別）。sing-box 唔支援 OpenVPN，故用 mihomo。
 # 注意版本：v1.19.25 會報 `proxy 213 has unset fields: tls-crypt`（openvpn 缺欄位），v1.19.26 正常。
 MIHOMO_VER="${MIHOMO_VER:-v1.19.26}"
-MIHOMO_TRIES="${MIHOMO_TRIES:-10}"
+MIHOMO_TRIES="${MIHOMO_TRIES:-25}"
 if [ "$USE_PROXY" != "1" ] && [ -n "${ZAMPO_SUB_URL:-}" ]; then
   echo "[2.5/4] mihomo 路線：cfnew 家宽訂閱 ..."
   if curl -sL --max-time 120 -o /tmp/mihomo.gz \
@@ -294,9 +294,18 @@ if [ "$USE_PROXY" != "1" ] && [ -n "${ZAMPO_SUB_URL:-}" ]; then
         python3 - <<'MIHOMO_PY' > /tmp/home_nodes.txt 2>/dev/null
 import json, urllib.request
 d = json.load(urllib.request.urlopen("http://127.0.0.1:9090/proxies", timeout=20))["proxies"]
-for k in d:
-    if "家宽" in k:
-        print(k)
+home = [k for k in d if "家宽" in k]
+# 2026-10-13 实测：同一订阅内 KR-家宽-01/02/03、TH-家宽-02 → Zampto 200；
+# JP-家宽 01..12、AU 全 403 ⇒ 逐個 IP 信譽。列表順序由提供者排（頭十條係 AU/JP），
+# 唔排序會白白燒晒 quota，故按「實測過嘅國家」優先。
+PRIO = ("KR", "TH", "VN", "TW", "HK", "SG")
+def rank(n):
+    for i, c in enumerate(PRIO):
+        if c + "-家宽" in n:
+            return i
+    return len(PRIO)
+for k in sorted(home, key=rank):
+    print(k)
 MIHOMO_PY
         TOTAL=$(wc -l < /tmp/home_nodes.txt | tr -d ' ')
         echo "      家宽落地 ${TOTAL} 條，逐條試（最多 ${MIHOMO_TRIES} 條）"
@@ -311,7 +320,12 @@ req = urllib.request.Request("http://127.0.0.1:9090/proxies/GLOBAL", method="PUT
       headers={"content-type": "application/json"})
 urllib.request.urlopen(req, timeout=15)
 MIHOMO_PY
-          sleep 5
+          sleep 4
+          # 快速預檢：連唔通就唔好花 20s×2 去 probe
+          if ! curl -s --max-time 8 --socks5-hostname 127.0.0.1:1080 -o /dev/null https://www.google.com; then
+            echo "      💀 ${NODE} 連唔到"
+            continue
+          fi
           if probe_zampto --socks5-hostname 127.0.0.1:1080; then
             echo "      ✅ 揀到乾淨住宅落地：${NODE}"
             USE_PROXY=1; CHOSEN_IP="mihomo:${NODE}"; break
