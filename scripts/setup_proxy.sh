@@ -191,8 +191,14 @@ fi
 # 即係标记判定只对「已登入请求」生效 —— 未登入 = **无定论**，唔可以当绿。
 # 现在：有 ZAMPTO_SESSION_SECRET 就带 cookie 探（真判据）；无 cookie 则回 3（无定论）。
 probe_zampto() {   # 用法: probe_zampto [curl 代理参数...]；0=干净 1=被标记 2=无响应 3=无定论(未登入)
-  local body page ca=()
-  if [ -n "$AUTH_COOKIE" ]; then ca=(-H "cookie: $AUTH_COOKIE"); else ca=(); fi
+  local body page ca=() csrf=""
+  if [ -n "$AUTH_COOKIE" ]; then
+    ca=(-H "cookie: $AUTH_COOKIE")
+    # 2026-10-13: 帶埋 X-XSRF-TOKEN，否則 API 會先回 CSRF_ERROR，蓋過真正嘅封鎖訊號
+    # （實測：只帶 cookie 時 renew 回 "Invalid CSRF token"，令人誤以為「API 鬆口」）
+    csrf=$(printf '%s' "$AUTH_COOKIE" | sed -n 's/.*zampto_csrf=\([^;]*\).*/\1/p')
+    [ -n "$csrf" ] && ca+=(-H "X-XSRF-TOKEN: $csrf")
+  fi
   body=$(curl -s --max-time 20 "$@" "${ca[@]}" -X POST https://dash.zampto.net/api/server/renew \
            -H 'content-type: application/json' -H 'x-requested-with: XMLHttpRequest' \
            --data '{"server_id":1}' 2>/dev/null || true)
