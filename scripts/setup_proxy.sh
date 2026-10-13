@@ -254,6 +254,7 @@ fi
 echo "[3/4] 依次尝试候选出口 (PROXY_URI -> TUIC_URI) ..."
 USE_PROXY=0
 CHOSEN_IP=""
+probe_rc=""   # 2026-10-13: 候選連唔通時 loop 直接 continue，probe_rc 從未賦值 → 下面分支會誤判
 for cand in "primary" "alt"; do
   if [ "$cand" = "primary" ]; then URI="$PROXY_URI"; else URI="$TUIC_URI"; fi
   [ -n "$URI" ] || continue
@@ -312,6 +313,9 @@ else
       echo "        对策: ① 用屋企线真人浏览器登入 → 抓新鲜 cookie 更新 ZAMPTO_SESSION_SECRET 再试；"
       echo "              ② 仍然 403 + /blocked → 要家宽/住宅出口（机房节点唔使再试）；"
       echo "              ③ 或直接人手撳 https://dash.zampto.net/（最快，30 秒）。"
+    elif [ "$direct_rc" = "1" ]; then
+      echo "[ERROR] 候选节点喺 GHA **连唔通**（port/协议被阻），而直连（带 session cookie）被标记。"
+      echo "        对策: 换一条喺 GHA 连得到嘅节点；或先更新 ZAMPTO_SESSION_SECRET（见下）。"
     else
       echo "[ERROR] 代理候选与直连都被 Zampto 标记/不可用 — 续期必失败。"
       echo "        对策: 换一条非 WARP/VPN 段的节点写进 PROXY_URI secret, 或人手去面板续期。"
