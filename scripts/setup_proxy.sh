@@ -285,7 +285,21 @@ if [ "$USE_PROXY" != "1" ] && [ -n "${ZAMPO_SUB_URL:-}" ]; then
        "https://github.com/MetaCubeX/mihomo/releases/download/${MIHOMO_VER}/mihomo-linux-amd64-${MIHOMO_VER}.gz" \
      && gzip -dc /tmp/mihomo.gz > /tmp/mihomo 2>/dev/null && chmod +x /tmp/mihomo; then
     echo "      ✅ mihomo $(/tmp/mihomo -v 2>&1 | head -1)"
-    if curl -s --max-time 60 -H "user-agent: v2rayNG/1.8.5" "$ZAMPO_SUB_URL" -o /tmp/sub.yaml && [ -s /tmp/sub.yaml ]; then
+    # 2026-10-16：訂閱主機（Cloudflare 前置）偶發下載失敗 —— 之前一次就放棄，
+    # 令整條 mihomo 路線被跳過、回退到機房候選 → 全部被標記 → 假紅
+    # （run 38839361333：`✗ 訂閱下載失敗` → PROXY_URI 3.35.168.225 → /blocked → ERROR）。
+    # 改為重試 3 次 + 驗內容似 YAML 訂閱（防 CF 挑戰 HTML 當成功）。
+    SUB_OK=0
+    for _try in 1 2 3; do
+      if curl -s --max-time 60 -H "user-agent: v2rayNG/1.8.5" "$ZAMPO_SUB_URL" -o /tmp/sub.yaml \
+         && [ -s /tmp/sub.yaml ] \
+         && grep -qE '^(proxies|proxy-groups|mixed-port|mode):' /tmp/sub.yaml; then
+        SUB_OK=1; break
+      fi
+      echo "      ⚠️ 訂閱下載第 ${_try}/3 次失敗，5 秒後重試"
+      sleep 5
+    done
+    if [ "$SUB_OK" = "1" ]; then
       sed -i 's/^mixed-port: .*/mixed-port: 1080/; s/^external-controller: .*/external-controller: 127.0.0.1:9090/; s/^mode: .*/mode: global/' /tmp/sub.yaml
       nohup /tmp/mihomo -f /tmp/sub.yaml -d /tmp/mihomo_data > /tmp/mihomo.log 2>&1 &
       sleep 18
