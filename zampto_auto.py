@@ -134,8 +134,15 @@ def mask_headers(headers):
 def snap(page, name):
     os.makedirs(LOG_DIR, exist_ok=True)
     fp = os.path.join(LOG_DIR, name)
-    page.screenshot(path=fp)
-    log.info("Screenshot: %s", fp)
+    # 2026-10-23：截圖失敗唔應該殺死整個瀏覽器續期流程。
+    # 實測 run 39841765632：`Page.captureScreenshot: Unable to capture screenshot`
+    # 直接拋出 → browser mode 中止 → fallback API → CSRF/captcha 失敗 → 紅單。
+    try:
+        page.screenshot(path=fp)
+        log.info("Screenshot: %s", fp)
+    except Exception as e:
+        log.warning("Screenshot 失敗（忽略，繼續流程）: %s: %s", type(e).__name__, e)
+        return None
     return fp
 
 
