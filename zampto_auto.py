@@ -88,6 +88,11 @@ FORCE_RENEW = env.get("FORCE_RENEW").lower() == "true"
 # 即使某次续期失败也还有 3 个 cron 周期的缓冲。
 # 想恢复旧行为就设 RENEW_THRESHOLD_HOURS=48（或更高）。
 RENEW_THRESHOLD_HOURS = env.get_int("RENEW_THRESHOLD_HOURS", 24)
+# 2026-11-05（抄 guanxi660-crypto/zampto-re 嘅 LOGIN_STABILIZE_SECONDS 做法）：
+# Turnstile 元件係延遲載入，撳完掣即刻去解會被判「未完成載入」→ 一直唔放行。
+# 我方 run 41966573072 / 41967653581 兩次都係「JS click 成功但 90s 未通過」。
+# 改為撳完先乾等 20 秒（可用 ZAM_PAGE_STABILIZE_MS 調）。
+PAGE_STABILIZE_MS = env.get_int("ZAM_PAGE_STABILIZE_MS", 20000)
 DASHBOARD_URL = "https://dash.zampto.net"
 SESSION_FILE = "./screenshots/session.json"
 LOG_DIR = "./screenshots"
@@ -1397,13 +1402,15 @@ def phase_browser_renewal(cookies=None):
                 except Exception:
                     renew_btn.click(force=True)
                     log.info("force click 成功")
-                page.wait_for_timeout(3000)
+                # 2026-11-05：撳完唔好即刻解 Turnstile —— 元件仲喺度載入。
+                log.info("⏳ 穩定等待 %d ms 讓 Turnstile 元件完整載入…", PAGE_STABILIZE_MS)
+                page.wait_for_timeout(PAGE_STABILIZE_MS)
                 snap(page, "03_after_renew.png")
                 # 移除遮擋 Turnstile 的彈窗 (privacy/cookie/consent)
                 dismiss_blocking_popups(page)
                 # 处理 Turnstile 安全验证 (Zampto 续期需要人机验证)
                 # v3 solve_turnstile: 先等 8s 自动通过, 失败后多次坐标点击 iframe checkbox (不同 offset)
-                turnstile_ok = solve_turnstile(page, max_wait=90, click_after=8)
+                turnstile_ok = solve_turnstile(page, max_wait=150, click_after=20)
                 if not turnstile_ok:
                     log.warning("Turnstile 90s 内未通过 (已尝试多次坐标点击), 继续验证 renewal 变化...")
                 page.wait_for_timeout(3000)
