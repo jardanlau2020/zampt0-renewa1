@@ -1449,6 +1449,13 @@ def phase_browser_renewal(cookies=None):
                     log.info("⏭️ renewal 未变化（面板回了 %s 但窗口没延长）"
                              "—— 视为还没到续期窗口，按「状态良好」报",
                              [r["status"] for r in captured_renew_responses] or "无响应")
+                    # 2026-11-14：已過期時「renewal 未變化」＝續期失敗，唔可以再當 skipped。
+                    # 11-13 兩轉就係咁連續報「状态良好（剩 -2 天）」靜默跳過，最終被站方 kill。
+                    _exp = _PAGE_STATE.get("expiry")
+                    _hours = _exp[1] if _exp else None
+                    if _hours is not None and _hours <= 0:
+                        log.error("❌ 已過期（%s）但 renewal 未變化 ⇒ 當續期失敗", _exp[2] if _exp else "?")
+                        return "failed"
                     return "skipped"
                 if any(r["status"] in (200, 201, 204, 202) for r in captured_renew_responses):
                     log.warning("⚠️ 读不到 renewal，无法确认；只能按 HTTP 状态判成功（旧行为）")
