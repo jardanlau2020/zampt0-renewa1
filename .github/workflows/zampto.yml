@@ -1,54 +1,54 @@
-﻿name: Zampto 鑷姩缁湡
+name: Zampto 自动续期
 
 on:
-  # 姣?8 灏忔椂锛圲TC 00/08/16锛夆€斺€?Zampto 鍒版湡绐楀彛鏄?48h锛岃繖涓鐜囩‘淇濊繃鐪煎墠
-  # 鑷冲皯鏈?5 娆℃満浼氥€?
+  # 每 8 小时（UTC 00/08/16）—— Zampto 到期窗口是 48h，这个频率确保过眼前
+  # 至少有 5 次机会。
   schedule:
     - cron: '0 */8 * * *'
   workflow_dispatch:
     inputs:
       force_renew:
-        description: '鏃犺鍓╀綑鏃堕棿寮哄埗缁湡'
+        description: '无视剩余时间强制续期'
         type: choice
         options: ['false', 'true']
         default: 'false'
       enable_recording:
-        description: '褰曞埗灞忓箷锛堟帓闅滅敤锛屼骇鐗╁彧鐣?3 澶╋級'
+        description: '录制屏幕（排障用，产物只留 3 天）'
         type: choice
         options: ['false', 'true']
         default: 'false'
       dry_run:
-        description: '婕旂粌锛氱収璺戜竴閬嶏紝浣嗚烦杩?Telegram 閫氱煡锛堟秷鎭師鏂囦細鎵撹繘鏃ュ織锛?
+        description: '演练：照跑一遍，但跳过 Telegram 通知（消息原文会打进日志）'
         type: boolean
         default: false
 
-# 鍘嗗彶鑳屾櫙锛?026-09-28 澶嶆椿閭ｆ锛屽埆鍒?鈥斺€?涓嬫绾㈢豢鐏椂鍏堢湅杩欐锛夛細
-#   褰撴椂绾㈢伅鏄袱浠朵簨鍙犲姞锛?a) 鏃?session cookie 宸插け鏁堬紙灏辩畻骞插噣鍑哄彛涔熷彧褰撴湭鐧诲綍
-#   鈫?307 /auth/login锛夛紱(b) 闃块噷浜戞満鎴垮嚭鍙ｅ湪绔欐柟 VPN 榛戝悕鍗曪紙甯︽湁鏁?session 鎵?
-#   瑙﹀彂 403 /blocked锛屾湭鐧诲綍鍙嶈€屾甯革紝鎵€浠ャ€屾棤 cookie 鎺㈤拡銆嶄細鎶婅鏍囪鐨勫嚭鍙?
-#   璇垽鎴愬共鍑€锛夈€傚绛栵細鎹?RO hysteria2 浣忓畢绾у嚭鍙?+ 鐢ㄦ埛浜叉墜璐寸殑鏂?session銆?
-#   瀹炴祴 run #70锛?6425660554锛塻uccess锛氬嚭鍙ｆ帰閽?PROXY_OK=1銆乀urnstile 63.8s
-#   鑷閫氳繃銆丳OST /api/server/renew 鈫?200銆?
-#   鑻ユ棩鍚庡啀绾細鍏堢湅鏄嚭鍙ｆ帰閽堝け璐ワ紙鎹㈣妭鐐癸級杩樻槸 session 澶辨晥锛堥噸鏂拌创 cookie锛夈€?
+# 历史背景（2026-09-28 复活那次，别删 —— 下次红绿灯时先看这段）：
+#   当时红灯是两件事叠加：(a) 旧 session cookie 已失效（就算干净出口也只当未登录
+#   → 307 /auth/login）；(b) 阿里云机房出口在站方 VPN 黑名单（带有效 session 才
+#   触发 403 /blocked，未登录反而正常，所以「无 cookie 探针」会把被标记的出口
+#   误判成干净）。对策：换 RO hysteria2 住宅级出口 + 用户亲手贴的新 session。
+#   实测 run #70（36425660554）success：出口探针 PROXY_OK=1、Turnstile 63.8s
+#   自行通过、POST /api/server/renew → 200。
+#   若日后再红：先看是出口探针失败（换节点）还是 session 失效（重新贴 cookie）。
 
 jobs:
   zampto-auto:
-    name: 妫€鏌ュ苟鑷姩缁湡
+    name: 检查并自动续期
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
       DISPLAY: ":99"
       LIBGL_ALWAYS_SOFTWARE: "1"
       GALLIUM_DRIVER: "llvmpipe"
-      # 鍏ㄩ儴鍑嵁鏉ヨ嚜 repo Secrets锛圫ettings -> Secrets and variables -> Actions锛夈€?
-      # .github/secrets_chunks.json 宸插垹闄わ細git 閲屼笉鍐嶆湁浠讳綍鍑嵁銆?
-      # 鈿?鑸婅ɑ瑙ｃ€孯EST API PUT /actions/secrets 鏈?7 瀛楃纭笂闄愩€嶅凡鏂?2026-09-28
-      #   璀夊伣锛氱敤 PyNaCl SealedBox锛坙ibsodium sealed box锛夊姞瀵嗗緦 PUT 瀹屽叏姝ｅ父
-      #   鈥斺€?鐣舵棩鎴愬姛瀵叆 182 瀛楃殑 PROXY_URI銆備箣鍓?422 鏄敤閷?Box 鑰岄潪 SealedBox銆?
+      # 全部凭据来自 repo Secrets（Settings -> Secrets and variables -> Actions）。
+      # .github/secrets_chunks.json 已删除：git 里不再有任何凭据。
+      # ⚠ 舊註解「REST API PUT /actions/secrets 有 7 字符硬上限」已於 2026-09-28
+      #   證偽：用 PyNaCl SealedBox（libsodium sealed box）加密後 PUT 完全正常
+      #   —— 當日成功寫入 182 字的 PROXY_URI。之前 422 是用錯 Box 而非 SealedBox。
       PROXY_URI: ${{ secrets.PROXY_URI }}
       TUIC_URI: ${{ secrets.TUIC_URI }}
-      # 2026-10-13 鍔狅細cfnew 瀹跺瑷傞柋锛坢ihomo/Clash YAML锛夈€傝惤鍦颁總鐪熶綇瀹呭甯讹紝
-      # 瀵︽脯 KR/TH 钀藉湴 鈫?/api/servers 200锛堟鎴跨瘈榛炰竴寰?403锛夈€傛湁鍜椾舰灏卞敂闈?PROXY_URI銆?
+      # 2026-10-13 加：cfnew 家宽訂閱（mihomo/Clash YAML）。落地係真住宅寬帶，
+      # 實測 KR/TH 落地 → /api/servers 200（機房節點一律 403）。有咗佢就唔靠 PROXY_URI。
       ZAMPO_SUB_URL: ${{ secrets.ZAMPO_SUB_URL }}
       ZAMPTO_SESSION_SECRET: ${{ secrets.ZAMPTO_SESSION_SECRET }}
       ZAMPTO_USERNAME: ${{ secrets.ZAMPTO_USERNAME }}
@@ -60,45 +60,45 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # 杩欎竴灞傛牎楠岀函绮规槸涓轰簡銆岀己 secret 鏃惰浜鸿瘽銆嶃€傚師鍏堝彧璁?PROXY_URI锛?
-      # 鑰?scripts/setup_proxy.sh 鏄?PROXY_URI -> TUIC_URI 涓ょ骇鍊欓€?鈥斺€?涔熷氨鏄?
-      # 鍙厤浜?TUIC_URI 鐨勪粨搴撲細鍦ㄦ牎楠屾灏辫鎷︿笅锛屽厹搴曞€欓€夋案杩滆疆涓嶅埌銆?
-      - name: "馃攽 鏍￠獙 Secrets 閰嶇疆"
+      # 这一层校验纯粹是为了「缺 secret 时说人话」。原先只认 PROXY_URI，
+      # 而 scripts/setup_proxy.sh 是 PROXY_URI -> TUIC_URI 两级候选 —— 也就是
+      # 只配了 TUIC_URI 的仓库会在校验步就被拦下，兜底候选永远轮不到。
+      - name: "🔑 校验 Secrets 配置"
         run: |
           set -uo pipefail
           missing=0
           for name in ZAMPTO_SESSION_SECRET ZAMPTO_USERNAME ZAMPTO_PASSWORD ZAMPTO_SERVER_ID; do
             val="${!name}"
             if [ -z "$val" ]; then
-              echo "[ERROR] Secret $name 鏈厤缃紒璇峰埌 Settings -> Secrets and variables -> Actions 娣诲姞"
+              echo "[ERROR] Secret $name 未配置！请到 Settings -> Secrets and variables -> Actions 添加"
               missing=1
             else
-              echo "[OK] $name 宸查厤缃?(${#val} chars)"
+              echo "[OK] $name 已配置 (${#val} chars)"
             fi
           done
           if [ -n "$ZAMPO_SUB_URL" ]; then
-            echo "[OK] cfnew 瀹跺璁㈤槄宸查厤缃?(ZAMPO_SUB_URL, ${#ZAMPO_SUB_URL} chars) 鈥斺€?mihomo 璺嚎"
+            echo "[OK] cfnew 家宽订阅已配置 (ZAMPO_SUB_URL, ${#ZAMPO_SUB_URL} chars) —— mihomo 路线"
           elif [ -n "$PROXY_URI" ]; then
-            echo "[OK] 浠ｇ悊鑺傜偣宸查厤缃?(PROXY_URI, ${#PROXY_URI} chars)"
+            echo "[OK] 代理节点已配置 (PROXY_URI, ${#PROXY_URI} chars)"
           elif [ -n "$TUIC_URI" ]; then
-            echo "[OK] 浠ｇ悊鑺傜偣宸查厤缃?(TUIC_URI 鍏滃簳, ${#TUIC_URI} chars)"
+            echo "[OK] 代理节点已配置 (TUIC_URI 兜底, ${#TUIC_URI} chars)"
           else
-            echo "[ERROR] ZAMPO_SUB_URL / PROXY_URI / TUIC_URI 閮芥病閰嶏紒GitHub 瑁稿嚭鍙ｄ細琚?Cloudflare 椋庢帶(403)锛岀画鏈熷繀澶辫触"
+            echo "[ERROR] ZAMPO_SUB_URL / PROXY_URI / TUIC_URI 都没配！GitHub 裸出口会被 Cloudflare 风控(403)，续期必失败"
             missing=1
           fi
           if [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
-            echo "[OK] Telegram 閫氱煡宸查厤缃?
+            echo "[OK] Telegram 通知已配置"
           else
-            echo "[WARN] Telegram 鏈厤缃?(TG_BOT_TOKEN / TG_CHAT_ID)锛屽け璐ュ皢鏃犳硶鎺ㄩ€佹彁閱?
+            echo "[WARN] Telegram 未配置 (TG_BOT_TOKEN / TG_CHAT_ID)，失败将无法推送提醒"
           fi
           [ "$missing" -eq 0 ] || exit 1
 
-      # 渚濊禆瀹夎銆佸嚭鍙ｅ噯澶囥€佷富鑴氭湰銆佸け璐ヤ骇鐗╀笌鍏滃簳閫氱煡鍏ㄥ湪杩欎竴姝ラ噷锛坮enew-kit
-      # composite action锛夈€傞『搴忔槸 apt -> pip -> setup-command -> command銆?
+      # 依赖安装、出口准备、主脚本、失败产物与兜底通知全在这一步里（renew-kit
+      # composite action）。顺序是 apt -> pip -> setup-command -> command。
       #
-      # setup-continue-on-error: 'false' 鈥斺€?鍑哄彛鍑嗗澶辫触锛堝€欓€変笌鐩磋繛閮借 Zampto
-      # 鏍囪锛夋椂鐩存帴涓锛屽埆璁╀富鑴氭湰鎷夸竴涓繀琚?403 鐨勫嚭鍙ｇ櫧璺?20 鍒嗛挓銆?
-      - name: 馃攧 杩愯缁湡鑴氭湰锛坮enew-kit锛?
+      # setup-continue-on-error: 'false' —— 出口准备失败（候选与直连都被 Zampto
+      # 标记）时直接中止，别让主脚本拿一个必被 403 的出口白跑 20 分钟。
+      - name: 🔄 运行续期脚本（renew-kit）
         uses: jardanlau2020/renew-kit/.github/actions/renew@v0.6.0
         with:
           script: zampto_auto.py
@@ -121,22 +121,22 @@ jobs:
         env:
           FORCE_RENEW: ${{ inputs.force_renew || 'false' }}
           ENABLE_RECORDING: ${{ inputs.enable_recording || 'false' }}
-          # 绌轰覆 = 鍏筹紙renewkit.env 鐨勭湡鍊奸泦鍚堟槸 1/true/yes/y/on锛?
+          # 空串 = 关（renewkit.env 的真值集合是 1/true/yes/y/on）
           DRY_RUN: ${{ inputs.dry_run && '1' || '' }}
 
-      - name: 馃Ы 娓呯悊杩涚▼
+      - name: 🧽 清理进程
         if: always()
         run: |
           pkill -f sing-box || true
           pkill -f chromium || true
           pkill -f Xvfb || true
 
-      - name: 馃帴 涓婁紶褰曞睆
+      - name: 🎥 上传录屏
         if: always() && inputs.enable_recording == 'true'
         uses: actions/upload-artifact@v7
         env:
-          # upload-artifact 鏄?Node 鍐欑殑锛歶ndici 涓嶈 socks5h:// 浠ｇ悊锛屼細鎶?
-          # "Invalid URL protocol"銆傝繖閲屾樉寮忔竻绌猴紝涓嶆寚鏈涗笂娓告楠ょ殑 $GITHUB_ENV銆?
+          # upload-artifact 是 Node 写的：undici 不认 socks5h:// 代理，会抛
+          # "Invalid URL protocol"。这里显式清空，不指望上游步骤的 $GITHUB_ENV。
           ALL_PROXY: ''
           HTTP_PROXY: ''
           HTTPS_PROXY: ''
@@ -146,4 +146,3 @@ jobs:
           path: /tmp/recording.mp4
           if-no-files-found: ignore
           retention-days: 3
-
