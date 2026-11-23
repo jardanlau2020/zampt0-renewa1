@@ -1359,23 +1359,17 @@ def phase_browser_renewal(cookies=None):
                          baseline_renewal, new_renewal)
                 return "renewed"
             if new_renewal:
-                # 2026-11-23：原来「renewal 未变化」一律当 skipped（「状态良好」），
-                # 结果 run 45071891542 那轮剩 6h 17min 也报状態良好，6 小时后到期被
-                # 站方回收（run 45113605633 才报「已過期」）。
-                # 「未到续期窗口」的前提是剩余还够；剩余已经 < 阈值就说明这轮必须续上，
-                # 没续上就是失败。
+                # 2026-11-23 判据修正（单变量）：走过续期动作而 renewal 没变，一律失败。
+                # 旧行为把「窗口没延长」当「状态良好」报 success —— run 45071891542 /
+                # 45113605633 就是这么绿到过期。真 skip 只剩「点击前剩余 > 阈值」
+                # 那一条（本函数前面已 return），这里不再有 skipped 出口。
                 _exp = _PAGE_STATE.get("expiry")
                 _hours = _exp[1] if _exp else None
-                if _hours is not None and _hours < RENEW_THRESHOLD_HOURS:
-                    log.error("❌ renewal 未变化且剩 %.1fh（<%dh）⇒ 判续期失败，"
-                              "不再按「状态良好」报", _hours, RENEW_THRESHOLD_HOURS)
-                    return "failed"
-                log.info("⏭️ renewal 未变化（fetch 回了成功但窗口没延长）"
-                         "—— 剩余 %s，按「未到续期窗口」报",
-                         f"{_hours:.1f}h（> {RENEW_THRESHOLD_HOURS}h）"
-                         if _hours is not None
-                         else f"未知（阈值 {RENEW_THRESHOLD_HOURS}h）")
-                return "skipped"
+                log.error("❌ 续期未生效：renewal 未变化，仍为 %r（剩 %s，阈值 %dh）",
+                          new_renewal,
+                          f"{_hours:.1f}h" if _hours is not None else "未知",
+                          RENEW_THRESHOLD_HOURS)
+                return "failed"
             if data.get("status") in (200, 201, 204, 202):
                 log.warning("⚠️ 读不到 renewal，无法确认；只能按 HTTP %s 判成功（旧行为）",
                             data.get("status"))
@@ -1469,26 +1463,21 @@ def phase_browser_renewal(cookies=None):
                              baseline_renewal, new_renewal)
                     return "renewed"
                 if new_renewal:
-                    log.info("⏭️ renewal 未变化（面板回了 %s 但窗口没延长）"
-                             "—— 判据看剩余时间，不再一律当「状态良好」",
+                    log.info("⏭️ renewal 未变化（面板回了 %s 但窗口没延长）",
                              [r["status"] for r in captured_renew_responses] or "无响应")
-                    # 2026-11-14：已過期時「renewal 未變化」＝續期失敗，唔可以再當 skipped。
-                    # 11-13 兩轉就係咁連續報「状态良好（剩 -2 天）」靜默跳過，最終被站方 kill。
+                    # 2026-11-23 判据修正（单变量）：走过点击流程而 renewal 没变 ⇒ 失败。
+                    # 旧行为在这里 return "skipped"，把「安全校验没过 / 没续上」洗成
+                    # 「状态良好」（run 45071891542、11-22 那两轮全是假绿）。
+                    # 真 skip 只剩「点击前剩余 > 阈值」那一条（本函数前面已 return）。
                     _exp = _PAGE_STATE.get("expiry")
                     _hours = _exp[1] if _exp else None
-                    if _hours is not None and _hours <= 0:
-                        log.error("❌ 已過期（%s）但 renewal 未變化 ⇒ 當續期失敗", _exp[2] if _exp else "?")
-                        return "failed"
-                    # 2026-11-23：剩 6h 17min 也报「状态良好」→ 6 小时后过期
-                    # （run 45071891542 / 45113605633）。剩余 < 阈值却没延长，就是失败。
-                    if turnstile_failed:
-                        log.error("❌ Turnstile 未出票且 renewal 未變化 ⇒ 判續期失敗")
-                        return "failed"
-                    if _hours is not None and _hours < RENEW_THRESHOLD_HOURS:
-                        log.error("❌ renewal 未變化且剩 %.1fh（<%dh）⇒ 判續期失敗，"
-                                  "不再按「状态良好」報", _hours, RENEW_THRESHOLD_HOURS)
-                        return "failed"
-                    return "skipped"
+                    log.error("❌ 续期未生效：renewal 未变化，仍为 %r（剩 %s，阈值 %dh，"
+                              "Turnstile 出票=%s）",
+                              new_renewal,
+                              f"{_hours:.1f}h" if _hours is not None else "未知",
+                              RENEW_THRESHOLD_HOURS,
+                              "否" if turnstile_failed else "是")
+                    return "failed"
                 if turnstile_failed:
                     log.error("❌ Turnstile 未出票，且读不到 renewal —— 不按 HTTP 状态判成功")
                     return "failed"
