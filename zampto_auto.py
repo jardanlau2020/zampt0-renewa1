@@ -1359,8 +1359,22 @@ def phase_browser_renewal(cookies=None):
                          baseline_renewal, new_renewal)
                 return "renewed"
             if new_renewal:
+                # 2026-11-23：原来「renewal 未变化」一律当 skipped（「状态良好」），
+                # 结果 run 45071891542 那轮剩 6h 17min 也报状態良好，6 小时后到期被
+                # 站方回收（run 45113605633 才报「已過期」）。
+                # 「未到续期窗口」的前提是剩余还够；剩余已经 < 阈值就说明这轮必须续上，
+                # 没续上就是失败。
+                _exp = _PAGE_STATE.get("expiry")
+                _hours = _exp[1] if _exp else None
+                if _hours is not None and _hours < RENEW_THRESHOLD_HOURS:
+                    log.error("❌ renewal 未变化且剩 %.1fh（<%dh）⇒ 判续期失败，"
+                              "不再按「状态良好」报", _hours, RENEW_THRESHOLD_HOURS)
+                    return "failed"
                 log.info("⏭️ renewal 未变化（fetch 回了成功但窗口没延长）"
-                         "—— 视为还没到续期窗口，按「状态良好」报")
+                         "—— 剩余 %s，按「未到续期窗口」报",
+                         f"{_hours:.1f}h（> {RENEW_THRESHOLD_HOURS}h）"
+                         if _hours is not None
+                         else f"未知（阈值 {RENEW_THRESHOLD_HOURS}h）")
                 return "skipped"
             if data.get("status") in (200, 201, 204, 202):
                 log.warning("⚠️ 读不到 renewal，无法确认；只能按 HTTP %s 判成功（旧行为）",
@@ -1395,6 +1409,10 @@ def phase_browser_renewal(cookies=None):
             renew_btn = page.query_selector('button:has-text("Renew"), a:has-text("Renew"), [data-action="renew"], #renew-btn')
             if renew_btn:
                 log.info("找到了 Renew 按钮, 点击...")
+                # 2026-11-23：「Turnstile 没出票」原来只记一条 warning 就往下走，
+                # 最后还能按 skipped/HTTP 200 报出去 —— 等于把「安全校验没过」洗成
+                # 「状态良好」。现在把它升级成判据的一部分。
+                turnstile_failed = False
                 # 用 JS 直接触发 click, 避免被 Cookie 弹窗 overlay 拦截
                 try:
                     renew_btn.evaluate("(el) => { el.click(); return true; }")
@@ -1412,7 +1430,12 @@ def phase_browser_renewal(cookies=None):
                 # v3 solve_turnstile: 先等 8s 自动通过, 失败后多次坐标点击 iframe checkbox (不同 offset)
                 turnstile_ok = solve_turnstile(page, max_wait=150, click_after=20)
                 if not turnstile_ok:
-                    log.warning("Turnstile 90s 内未通过 (已尝试多次坐标点击), 继续验证 renewal 变化...")
+                    # 不再只记日志：Zampto 的续期 POST 带 captchaProvider=hcaptcha/
+                    # turnstile，没出票就是「安全校验未过」。下面验证 renewal 时，
+                    # 没变化 + 没出票 ⇒ 直接判失败；即使 HTTP 200 也不判成功。
+                    turnstile_failed = True
+                    log.error("❌ Turnstile 150s 内未出票（已尝试多次坐标点击）"
+                              "⇒ 本轮不会把「没变化」当「状态良好」")
                 page.wait_for_timeout(3000)
                 snap(page, "04_after_verify.png")
                 log.info("按钮点击完成, 等待 3s 后验证续期结果...")
@@ -1447,7 +1470,7 @@ def phase_browser_renewal(cookies=None):
                     return "renewed"
                 if new_renewal:
                     log.info("⏭️ renewal 未变化（面板回了 %s 但窗口没延长）"
-                             "—— 视为还没到续期窗口，按「状态良好」报",
+                             "—— 判据看剩余时间，不再一律当「状态良好」",
                              [r["status"] for r in captured_renew_responses] or "无响应")
                     # 2026-11-14：已過期時「renewal 未變化」＝續期失敗，唔可以再當 skipped。
                     # 11-13 兩轉就係咁連續報「状态良好（剩 -2 天）」靜默跳過，最終被站方 kill。
@@ -1456,7 +1479,19 @@ def phase_browser_renewal(cookies=None):
                     if _hours is not None and _hours <= 0:
                         log.error("❌ 已過期（%s）但 renewal 未變化 ⇒ 當續期失敗", _exp[2] if _exp else "?")
                         return "failed"
+                    # 2026-11-23：剩 6h 17min 也报「状态良好」→ 6 小时后过期
+                    # （run 45071891542 / 45113605633）。剩余 < 阈值却没延长，就是失败。
+                    if turnstile_failed:
+                        log.error("❌ Turnstile 未出票且 renewal 未變化 ⇒ 判續期失敗")
+                        return "failed"
+                    if _hours is not None and _hours < RENEW_THRESHOLD_HOURS:
+                        log.error("❌ renewal 未變化且剩 %.1fh（<%dh）⇒ 判續期失敗，"
+                                  "不再按「状态良好」報", _hours, RENEW_THRESHOLD_HOURS)
+                        return "failed"
                     return "skipped"
+                if turnstile_failed:
+                    log.error("❌ Turnstile 未出票，且读不到 renewal —— 不按 HTTP 状态判成功")
+                    return "failed"
                 if any(r["status"] in (200, 201, 204, 202) for r in captured_renew_responses):
                     log.warning("⚠️ 读不到 renewal，无法确认；只能按 HTTP 状态判成功（旧行为）")
                     return "renewed"
@@ -1788,6 +1823,7 @@ def phase_api_renewal(use_cookies=None) -> RenewReport:
                 if should_renew:
                     log.info("Renewing server (%d h left, threshold: %dh)", total_h, RENEW_THRESHOLD_HOURS)
                     renewed = False
+                    api_http_ok = False
                     # Confirmed correct endpoint: POST /api/server/renew
                     # Body field name unknown - try multiple variants
                     # Note: server may also require captcha (cf-turnstile-response)
@@ -1884,9 +1920,13 @@ def phase_api_renewal(use_cookies=None) -> RenewReport:
                                                  resp.text[:200], hdr, len(tok), vtag)
 
                                         if resp.status_code in [200, 201, 204, 202]:
-                                            report["action"] = "renewed"
-                                            log.info("  ✓ Renewal successful (status %d, body=%s, hdr=%s)", resp.status_code, body, hdr)
-                                            renewed = True
+                                            # 2026-11-23：不再凭 HTTP 200 宣布续期成功。
+                                            # 面板对「还没到窗口」「captcha 没过」也回 200
+                                            # （run #88 就是这么「成功」了一整月）。唯一
+                                            # 可信的判据是 renewal 有没有动，下面统一复核。
+                                            log.info("  ℹ️ renew 回 HTTP %d body=%s hdr=%s —— 待核对 renewal",
+                                                     resp.status_code, resp.text[:200], hdr)
+                                            api_http_ok = True
                                             renew_success = True
                                             break
                                         # CSRF 失败换下一个组合; 其他业务错误(如冷却期)则停止
@@ -1907,6 +1947,32 @@ def phase_api_renewal(use_cookies=None) -> RenewReport:
                                 break  # Don't try more variants, captcha is the blocker
                         except Exception as e:
                             log.warning("    Request failed: %s", e)
+
+                    # 2026-11-23：HTTP 200 之后必须核对 renewal —— 面板回了 200 但窗口
+                    # 没延长（captcha 没过 / 还没到窗口）时，以前直接报 renewed。
+                    if api_http_ok and not renewed:
+                        _base = report.get("expiry")
+                        _cur = None
+                        for _ in range(3):
+                            try:
+                                _cur = query_renewal_field(cookies=cookies)
+                            except Exception as e:
+                                log.warning("  renewal 复核查询失败: %s", e)
+                                _cur = None
+                            if _cur and _cur != _base:
+                                break
+                            time.sleep(3)
+                        if _cur and _cur != _base:
+                            log.info("  ✅ 续期确认成功: renewal 已更新 %r -> %r", _base, _cur)
+                            report["action"] = "renewed"
+                            report["expiry"] = str(_cur)
+                            renewed = True
+                        else:
+                            log.error("  ❌ renew 回 HTTP 200 但 renewal 未变化（%r）⇒ 判续期失败", _cur)
+                            report["error"] = ("面板回 HTTP 200 但 renewal 未变化"
+                                               "（剩 %sh，阈值 %dh）"
+                                               % (report.get("hours_left"),
+                                                  RENEW_THRESHOLD_HOURS))
 
                     if not renewed and not report.get("error"):
                         report["error"] = "Renewal failed - could not find correct body format"
