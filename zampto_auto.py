@@ -723,13 +723,11 @@ def solve_canvas_captcha(page, max_wait=45):
 
     2026-11-24 run 45349187819 根因：面板 renew 弹的是 canvas 点选
     ("Renew Server / QUICK VERIFICATION / Tap the Coffee card")，不是 Turnstile。
-    旧脚本对它 (a) dismiss_blocking_popups 把弹窗 × 关掉、(b) solve_turnstile
-    找不到 iframe 就打印「未出现 Turnstile」直接返回 → 面板前端自己乱点
-    (canvas_click_x=170 → 点了星形卡，题目要 Coffee) → Incorrect item tapped，
-    renewal 不动。这里读题目目标词，按卡片 SVG 的 class / aria / data 找对应
-    图标卡并点它。
+    旧脚本 (a) dismiss_blocking_popups 把弹窗 × 关掉、(b) solve_turnstile
+    找不到 iframe 就当"未出现"放行 → 面板前端自己乱点第一张卡 → Incorrect item
+    tapped，renewal 不动。这里读题目目标词，找到对应图标卡并点它。
 
-    返回: "solved" / "no-modal"（非 canvas 模式）/ "unknown"（识别不到，留诊断）
+    返回: "solved" / "no-modal"（非 canvas 模式）/ "unknown"（识别不到）
     """
     target = None
     deadline = time.time() + max_wait
@@ -753,139 +751,79 @@ def solve_canvas_captcha(page, max_wait=45):
 
     log.info("  🎯 canvas 点选挑战: Tap the %s card", target)
 
-    diag = page.evaluate("""() => {
-        const cand = [...document.querySelectorAll('div,section')].filter(el => {
-            const t = el.innerText || '';
-            return /Tap the\\s+\\w+\\s+card/i.test(t) &&
-                   el.querySelectorAll('svg').length >= 2 &&
-                   t.length < 600;
-        });
-        if (!cand.length) return {error: 'no-root'};
-        cand.sort((a,b) => (a.innerText||'').length - (b.innerText||'').length);
-        const root = cand[0];
-        const out = [];
-        for (const card of root.querySelectorAll('button,[role="button"],div')) {
-            const svg = card.querySelector('svg');
-            if (!svg) continue;
-            const r = card.getBoundingClientRect();
-            if (r.width < 20 || r.height < 20) continue;
-            const cls = (svg.getAttribute('class')||'') + ' ' +
-                        (svg.className && svg.className.baseVal || '');
-            const label = card.getAttribute('aria-label') || card.getAttribute('title') ||
-                          svg.getAttribute('aria-label') || '';
-            // lucide 图标组件会带 data-lucide="coffee" 等属性 —— 最可靠的图标名来源。
-            const iconName = svg.getAttribute('data-lucide') || '';
-            const data = [...card.attributes].filter(a=>a.name.startsWith('data-'))
-                            .map(a=>a.name+'='+a.value).join(' ') + ' ' +
-                         [...svg.attributes].filter(a=>a.name.startsWith('data-'))
-                            .map(a=>'svg-'+a.name+'='+a.value).join(' ');
-            out.push({tag: card.tagName, cls: cls.trim().slice(0,120),
-                      label: String(label).slice(0,80), data: data.slice(0,160),
-                      icon: iconName.slice(0,60),
-                      x: Math.round(r.left+r.width/2), y: Math.round(r.top+r.height/2),
-                      html: card.outerHTML.slice(0,300)});
+    # 探测 JS：读题目 + 列出所有"卡片方框"。卡片 svg 的 class 也是
+    # "lucide lucide-moon h-5 w-5"，按尺寸排不掉；真正的区别是卡片 svg
+    # 坐在一个 60-90px 的方框里，标题旁提示图标的祖先很小 → 向上找方框。
+    DETECT_JS = """() => {
+        const t = document.body ? document.body.innerText : '';
+        const m = /Tap the\\s+([A-Za-z]+)\\s+card/i.exec(t);
+        const target = m ? m[1].toLowerCase() : null;
+        const err = /Incorrect item tapped|verification failed|Try again/i.test(t);
+        const modal = /Renew Server|QUICK VERIFICATION/i.test(t);
+        const svgs = [...document.querySelectorAll('svg.lucide')];
+        const seen = new Set();
+        const cards = [];
+        for (const svg of svgs) {
+            const iconCls = svg.getAttribute('class') || '';
+            const im = /lucide-([a-z0-9-]+)/.exec(iconCls);
+            const icon = im ? im[1] : '';
+            let box = null, el = svg;
+            for (let i=0; i<5 && el; i++) {
+                el = el.parentElement;
+                if (!el) break;
+                const r = el.getBoundingClientRect();
+                if (r.width >= 45 && r.width <= 130 && r.height >= 45 && r.height <= 130) {
+                    box = el; break;
+                }
+            }
+            if (!box || seen.has(box)) continue;
+            seen.add(box);
+            const r = box.getBoundingClientRect();
+            cards.push({icon: icon, tag: box.tagName,
+                        x: Math.round(r.left+r.width/2), y: Math.round(r.top+r.height/2),
+                        w: Math.round(r.width), h: Math.round(r.height),
+                        html: box.outerHTML.slice(0,220)});
         }
-        return {cards: out, rootHtml: root.outerHTML.slice(0,1500)};
-    }""")
-    if diag.get("error"):
-        log.warning("  canvas: DOM 探测失败 (%s)", diag["error"])
-        return "unknown"
-
-    cards = diag.get("cards", [])
-    log.info("  canvas: 识别到 %d 张卡", len(cards))
-    for i, c in enumerate(cards):
-        log.info("    [%d] %s icon=%r cls=%r label=%r data=%r xy=(%d,%d)",
-                 i, c["tag"], c.get("icon",""), c["cls"], c["label"], c["data"], c["x"], c["y"])
-
-    # 题目词 → 可能的 lucide 图标名 / class 片段（截图里是 lucide 线描图标）。
+        return {target: target, err: err, cards: cards, modal: modal};
+    }"""
     synonyms = {
         "coffee": ["coffee", "cup", "coffeecup", "mug"],
-        "flame": ["flame", "fire"],
-        "star": ["star"],
-        "bell": ["bell"],
-        "key": ["key"],
-        "heart": ["heart"],
-        "moon": ["moon"],
-        "sun": ["sun"],
-        "leaf": ["leaf"],
-        "music": ["music", "music2"],
+        "flame": ["flame", "fire"], "star": ["star"], "bell": ["bell"],
+        "key": ["key"], "heart": ["heart"], "moon": ["moon"],
+        "sun": ["sun"], "leaf": ["leaf"], "music": ["music", "music2"],
     }
-    keys = synonyms.get(target, [target])
-    hit = None
-    for c in cards:
-        blob = (c.get("icon","") + " " + c["cls"] + " " + c["label"] + " " + c["data"]).lower()
-        for k in keys:
-            if k in blob:
-                hit = c
-                break
-        if hit:
-            break
-    if not hit:
-        log.warning("  canvas: 找不到 %s 图标卡；DOM 供下一轮精调: %s",
-                    target, diag.get("rootHtml", "")[:2000])
-        return "unknown"
 
     try:
-        # 题目每轮换、卡片顺序也重排；面板前端还有个 ~49s 的自动乱点定时器。
-        # 这里点正确的卡并等 3s 看弹窗是否消失（=通过）；若换新题目则重解，
-        # 最多 4 轮，抢在自动乱点把机会耗光之前完成。
-        for attempt in range(4):
-            page.mouse.click(hit["x"], hit["y"])
-            log.info("  ✅ canvas: 点了 %s 卡 @ (%d,%d) (第 %d 次)",
-                     target, hit["x"], hit["y"], attempt + 1)
-            page.wait_for_timeout(3000)
-            state = page.evaluate("""() => {
-                const t = document.body ? document.body.innerText : '';
-                const m = /Tap the\\s+([A-Za-z]+)\\s+card/i.exec(t);
-                const err = /Incorrect item tapped|verification failed|Try again/i.test(t);
-                return {target: m ? m[1].toLowerCase() : null, err: err};
-            }""")
-            if not state.get("target"):
+        # 每次尝试都重新读题目+重探测（卡片顺序会重排），点正确方框。
+        # 面板前端还有个 ~49s 自动乱点定时器，抢在它耗光机会前完成。
+        for attempt in range(5):
+            st = page.evaluate(DETECT_JS)
+            if not st.get("modal") and not st.get("target"):
                 log.info("  ✅ canvas: 弹窗已消失，点选通过")
                 return "solved"
-            if state.get("err") or state["target"] != target:
-                log.info("  canvas: 未通过（新题=%s err=%s），重解…",
-                         state.get("target"), state.get("err"))
-                target = state["target"] or target
-                # 重新探测卡片
-                diag2 = page.evaluate("""() => {
-                    const cand = [...document.querySelectorAll('div,section')].filter(el => {
-                        const t = el.innerText || '';
-                        return /Tap the\\s+\\w+\\s+card/i.test(t) &&
-                               el.querySelectorAll('svg').length >= 2 && t.length < 600;
-                    });
-                    if (!cand.length) return {cards: []};
-                    cand.sort((a,b) => (a.innerText||'').length - (b.innerText||'').length);
-                    const out = [];
-                    for (const card of cand[0].querySelectorAll('button,[role="button"],div')) {
-                        const svg = card.querySelector('svg');
-                        if (!svg) continue;
-                        const r = card.getBoundingClientRect();
-                        if (r.width < 20 || r.height < 20) continue;
-                        out.push({icon: svg.getAttribute('data-lucide')||'',
-                                  cls: (svg.getAttribute('class')||''),
-                                  x: Math.round(r.left+r.width/2),
-                                  y: Math.round(r.top+r.height/2)});
-                    }
-                    return {cards: out};
-                }""")
-                newhit = None
-                for c in diag2.get("cards", []):
-                    blob = (c.get("icon","") + " " + c.get("cls","")).lower()
-                    for k in synonyms.get(target, [target]):
-                        if k in blob:
-                            newhit = c
-                            break
-                    if newhit: break
-                if newhit:
-                    hit = newhit
-                else:
-                    log.warning("  canvas: 重解找不到 %s 卡", target)
-                    return "unknown"
-            else:
-                # 题目没变也没报错，可能点在等服务端确认，再等一轮
-                page.wait_for_timeout(2000)
-        log.warning("  canvas: %d 次尝试后仍未通过", 4)
+            cur = (st.get("target") or target).lower()
+            cards = st.get("cards", [])
+            log.info("  canvas: [%d] 题目=%s 识别到 %d 张卡 err=%s",
+                     attempt + 1, cur, len(cards), st.get("err"))
+            for i, c in enumerate(cards):
+                log.info("    [%d] icon=%r %s %dx%d xy=(%d,%d)",
+                         i, c.get("icon",""), c["tag"], c.get("w",0),
+                         c.get("h",0), c["x"], c["y"])
+            keys = synonyms.get(cur, [cur])
+            hit = None
+            for c in cards:
+                if any(k in c.get("icon","").lower() for k in keys):
+                    hit = c; break
+            if not hit:
+                log.warning("  canvas: 找不到 %s 卡；DOM: %s",
+                            cur, " | ".join(c.get("html","")[:180] for c in cards)[:1800])
+                page.wait_for_timeout(1500)
+                continue
+            page.mouse.click(hit["x"], hit["y"])
+            log.info("  ✅ canvas: 点了 %s @ (%d,%d) (第 %d 次)",
+                     cur, hit["x"], hit["y"], attempt + 1)
+            page.wait_for_timeout(3500)
+        log.warning("  canvas: %d 次尝试后仍未通过", 5)
         return "unknown"
     except Exception as e:
         log.warning("  canvas: 点击失败: %s", e)
