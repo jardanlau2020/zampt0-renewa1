@@ -718,6 +718,148 @@ def solve_turnstile(page, max_wait=90, click_after=8):
     return False
 
 
+def solve_canvas_captcha(page, max_wait=45):
+    """解 Zampto 的 canvas「Tap the <icon> card」图标点选验证。
+
+    2026-11-24 run 45349187819 根因：面板 renew 弹 canvas 点选
+    ("Tap the Coffee card")，不是 Turnstile。旧脚本关弹窗 + 不认 canvas，
+    面板前端乱点第一张卡 → Incorrect item tapped，renewal 不动。
+
+    v4（三次实测后）：卡片在「Renew Server / Tap the X card」弹窗内，
+    标题旁提示图标是 svg.lucide-<目标词>（小），卡片里是内联 svg（无
+    lucide class）。用提示图标的 path 当指纹，在弹窗内按 y 坐标分组
+    锁定卡片行（4 个同 y 的图标），找 path 相同的卡点它。
+
+    返回: "solved" / "no-modal" / "unknown"
+    """
+    target = None
+    deadline = time.time() + max_wait
+    while time.time() < deadline:
+        try:
+            probe = page.evaluate("""() => {
+                const t = document.body ? document.body.innerText : '';
+                const m = /Tap the\\s+([A-Za-z]+)\\s+card/i.exec(t);
+                return {target: m ? m[1] : null,
+                        modal: /QUICK VERIFICATION|Anti-Bot Verification|Renew Server/i.test(t)};
+            }""")
+            if probe.get("target"):
+                target = probe["target"].lower()
+                break
+        except Exception:
+            pass
+        page.wait_for_timeout(500)
+    if not target:
+        log.info("  ℹ️ canvas: 未出现点选弹窗（非 canvas 模式）")
+        return "no-modal"
+
+    log.info("  🎯 canvas 点选挑战: Tap the %s card", target)
+
+    DETECT_JS = """() => {
+        const t = document.body ? document.body.innerText : '';
+        const m = /Tap the\\s+([A-Za-z]+)\\s+card/i.exec(t);
+        const cur = m ? m[1].toLowerCase() : null;
+        const err = /Incorrect item tapped|verification failed|Try again/i.test(t);
+        const modal = /Renew Server|QUICK VERIFICATION/i.test(t);
+        // 1) 找弹窗根：包含 "Tap the X card"、有 >=2 个 svg、文本 < 600 的最小 div。
+        const cands = [...document.querySelectorAll('div,section')].filter(el => {
+            const txt = el.innerText || '';
+            return /Tap the\\s+\\w+\\s+card/i.test(txt) &&
+                   el.querySelectorAll('svg').length >= 2 && txt.length < 600;
+        });
+        // 关键修复：取 svg 最多的容器（含卡片的弹窗），不是文本最短的（标题 div）。
+        cands.sort((a,b) => b.querySelectorAll('svg').length - a.querySelectorAll('svg').length);
+        if (!cands.length) return {target: cur, err: err, modal: modal, cards: [], note: 'no-root'};
+        const root = cands[0];
+        // 2) 提示图标：root 内 svg.lucide-xxx 且小尺寸(<=30)，优先匹配当前题目词。
+        const dstr = s => [...s.querySelectorAll('path,circle,line,rect,polyline,polygon')]
+                            .map(p => (p.getAttribute('d')||p.getAttribute('cx')||
+                                       p.getAttribute('x1')||'')).join('|').slice(0,500);
+        const small = [...root.querySelectorAll('svg.lucide')].filter(s => {
+            const r = s.getBoundingClientRect(); return r.width<=30 && r.height<=30;
+        });
+        const hint = small.find(s => (s.getAttribute('class')||'').toLowerCase().includes('lucide-'+cur));
+        const ref = hint ? dstr(hint) : '';
+        // 3) 卡片行：root 内所有 svg，按中心 y 分组，取元素数最多的一组
+        //    （4 张卡同 y；标题提示图标 y 不同且只有 1 个）。
+        const items = [];
+        for (const svg of root.querySelectorAll('svg')) {
+            const r = svg.getBoundingClientRect();
+            if (r.width < 10 || r.height < 10) continue;
+            let box = svg.parentElement;
+            const br = box ? box.getBoundingClientRect() : r;
+            items.push({y: Math.round(r.top+r.height/2),
+                        x: Math.round((br.left||r.left)+(br.width||r.width)/2),
+                        by: Math.round(br.top+br.height/2),
+                        d: dstr(svg), cls: (svg.getAttribute('class')||'').slice(0,80),
+                        w: Math.round(br.width||r.width), h: Math.round(br.height||r.height),
+                        html: (box?box.outerHTML:svg.outerHTML).slice(0,400)});
+        }
+        const groups = {};
+        for (const it of items) { const k = Math.round(it.by/10)*10; (groups[k]=groups[k]||[]).push(it); }
+        let row = [];
+        for (const k of Object.keys(groups)) if (groups[k].length > row.length) row = groups[k];
+        const cards = row.map(it => ({tag:'CARD', x:it.x, y:it.by, w:it.w, h:it.h,
+                                      d:it.d, cls:it.cls, html:it.html}));
+        return {target: cur, err: err, modal: modal, ref: ref,
+                smallClasses: small.map(s=>s.getAttribute('class')),
+                allGroups: Object.keys(groups).map(k=>k+':'+groups[k].length),
+                cards: cards,
+                rootHtml: root.outerHTML.slice(0,4000)};
+    }"""
+    synonyms = {
+        "coffee": ["coffee", "cup", "mug"], "flame": ["flame", "fire"],
+        "star": ["star"], "bell": ["bell"], "key": ["key"],
+        "heart": ["heart"], "moon": ["moon"], "sun": ["sun"],
+        "leaf": ["leaf"], "music": ["music"], "gem": ["gem", "diamond"],
+        "rocket": ["rocket"], "zap": ["zap"], "crown": ["crown"],
+    }
+
+    try:
+        for attempt in range(5):
+            st = page.evaluate(DETECT_JS)
+            if not st.get("modal") and not st.get("target"):
+                log.info("  ✅ canvas: 弹窗已消失，点选通过")
+                return "solved"
+            cur = (st.get("target") or target).lower()
+            cards = st.get("cards", [])
+            ref = st.get("ref") or ""
+            log.info("  canvas: [%d] 题目=%s 卡片=%d 指纹=%s 分组=%s 小图标=%s",
+                     attempt + 1, cur, len(cards), bool(ref), st.get("allGroups"),
+                     st.get("smallClasses"))
+            if attempt == 0:
+                log.info("  canvas ROOT DOM: %s", (st.get("rootHtml") or "")[:3500])
+            for i, c in enumerate(cards):
+                log.info("    [%d] %s %dx%d xy=(%d,%d) d=%s cls=%r",
+                         i, c["tag"], c.get("w",0), c.get("h",0), c["x"], c["y"],
+                         c.get("d","")[:60], c.get("cls",""))
+
+            hit = None
+            if ref:
+                for c in cards:
+                    d = c.get("d","")
+                    if d and (d == ref or (len(d)>40 and d in ref) or (len(ref)>40 and ref in d)):
+                        hit = c; break
+            if not hit:
+                keys = synonyms.get(cur, [cur])
+                for c in cards:
+                    if any(k in c.get("cls","").lower() for k in keys):
+                        hit = c; break
+            if not hit:
+                log.warning("  canvas: 找不到 %s 卡；DOM: %s",
+                            cur, " | ".join(c.get("html","")[:250] for c in cards)[:2200])
+                page.wait_for_timeout(1500)
+                continue
+            page.mouse.click(hit["x"], hit["y"])
+            log.info("  ✅ canvas: 点了 %s 卡 @ (%d,%d) (第 %d 次)",
+                     cur, hit["x"], hit["y"], attempt + 1)
+            page.wait_for_timeout(3500)
+        log.warning("  canvas: 5 次尝试后仍未通过")
+        return "unknown"
+    except Exception as e:
+        log.warning("  canvas: 点击失败: %s", e)
+        return "unknown"
+
+
 def wait_for_url_change(page, start_url, max_wait=30):
     """Poll until URL changes from start_url."""
     for i in range(max_wait):
@@ -1418,18 +1560,27 @@ def phase_browser_renewal(cookies=None):
                 log.info("⏳ 穩定等待 %d ms 讓 Turnstile 元件完整載入…", PAGE_STABILIZE_MS)
                 page.wait_for_timeout(PAGE_STABILIZE_MS)
                 snap(page, "03_after_renew.png")
-                # 移除遮擋 Turnstile 的彈窗 (privacy/cookie/consent)
-                dismiss_blocking_popups(page)
-                # 处理 Turnstile 安全验证 (Zampto 续期需要人机验证)
-                # v3 solve_turnstile: 先等 8s 自动通过, 失败后多次坐标点击 iframe checkbox (不同 offset)
-                turnstile_ok = solve_turnstile(page, max_wait=150, click_after=20)
-                if not turnstile_ok:
-                    # 不再只记日志：Zampto 的续期 POST 带 captchaProvider=hcaptcha/
-                    # turnstile，没出票就是「安全校验未过」。下面验证 renewal 时，
-                    # 没变化 + 没出票 ⇒ 直接判失败；即使 HTTP 200 也不判成功。
-                    turnstile_failed = True
-                    log.error("❌ Turnstile 150s 内未出票（已尝试多次坐标点击）"
-                              "⇒ 本轮不会把「没变化」当「状态良好」")
+
+                # 2026-11-24：按弹窗类型分流。面板现在弹 canvas 点选
+                # ("Tap the Coffee card")，不再是 Turnstile。旧脚本无差别
+                # dismiss_blocking_popups（把弹窗 × 关掉）+ solve_turnstile
+                # （找不到 iframe 当"未出现"放行）→ 面板前端自己乱点错卡 →
+                # Incorrect item tapped，renewal 不动（run 45349187819）。
+                # canvas 弹窗期间这两步都不能做，改由求解器点正确的卡。
+                canvas_result = solve_canvas_captcha(page, max_wait=45)
+                if canvas_result == "no-modal":
+                    # 非 canvas：沿用原 Turnstile/hcaptcha 路径。
+                    dismiss_blocking_popups(page)
+                    turnstile_ok = solve_turnstile(page, max_wait=150, click_after=20)
+                    if not turnstile_ok:
+                        # 没出票 + renewal 没变化 ⇒ 判失败，不报状态良好。
+                        turnstile_failed = True
+                        log.error("❌ Turnstile 150s 内未出票（已尝试多次坐标点击）"
+                                  "⇒ 本轮不会把「没变化」当「状态良好」")
+                else:
+                    # canvas 模式：没有 Turnstile 票据可等，成败只看 renewal 变化。
+                    log.info("  canvas 处理结果=%s ⇒ 成败以 renewal 是否变化为准",
+                             canvas_result)
                 page.wait_for_timeout(3000)
                 snap(page, "04_after_verify.png")
                 log.info("按钮点击完成, 等待 3s 后验证续期结果...")
