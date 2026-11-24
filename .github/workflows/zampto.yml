@@ -99,11 +99,11 @@ jobs:
       # setup-continue-on-error: 'false' —— 出口准备失败（候选与直连都被 Zampto
       # 标记）时直接中止，别让主脚本拿一个必被 403 的出口白跑 20 分钟。
       - name: 🔄 运行续期脚本（renew-kit）
-        uses: jardanlau2020/renew-kit/.github/actions/renew@v0.5.3
+        uses: jardanlau2020/renew-kit/.github/actions/renew@v0.6.0
         with:
           script: zampto_auto.py
           python-version: '3.12'
-          renewkit-ref: v0.5.3
+          renewkit-ref: v0.6.0
           apt-packages: >-
             xvfb ffmpeg curl unzip fonts-noto-cjk
             libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2

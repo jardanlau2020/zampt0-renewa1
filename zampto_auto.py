@@ -48,7 +48,7 @@ except ImportError:
     print("requests not installed. Install: pip install requests")
     raise
 
-from renewkit import env, notify, timeutil
+from renewkit import env, notify, timeutil, verdict
 from renewkit.outcome import Outcome
 from renewkit.report import RenewReport, shorten
 
@@ -2142,7 +2142,11 @@ def _to_renew_report(report) -> RenewReport:
 
 def _finish(report) -> int:
     """渲染 + 打印 + 发一条 TG + 返回退出码。"""
-    return _to_renew_report(report).finish()
+    rr = _to_renew_report(report)
+    # 落判据给 renew-kit 的 Gate 步骤读；与 finish() 退出码同源同口径。
+    verdict.record(rr.worst, detail=" | ".join(
+        f"{r.name}:{r.outcome.value}" for r in rr.results))
+    return rr.finish()
 
 
 def _fmt_remaining(expire_at) -> str:
@@ -2352,6 +2356,9 @@ def main() -> int:
     log.info("浏览器续期未成功(%s), 尝试 API 模式...", status)
     rr = phase_api_renewal(use_cookies=cookies)
     log.info("API 路径结果: %s", rr.worst.value)
+    # 落判据给 renew-kit 的 Gate 步骤读；与 finish() 退出码同源同口径。
+    verdict.record(rr.worst, detail=" | ".join(
+        f"{r.name}:{r.outcome.value}" for r in rr.results))
     # 报告与退出码都在这里统一落地（旧版这条路上会发两条 🚨：API 路径自己发一条，
     # main 又发一条）
     return rr.finish()
