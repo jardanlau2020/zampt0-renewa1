@@ -721,13 +721,17 @@ def solve_turnstile(page, max_wait=90, click_after=8):
 def solve_canvas_captcha(page, max_wait=45):
     """解 Zampto 的 canvas「Tap the <icon> card」图标点选验证。
 
-    2026-11-24 run 45349187819 根因：面板 renew 弹的是 canvas 点选
-    ("Renew Server / QUICK VERIFICATION / Tap the Coffee card")，不是 Turnstile。
-    旧脚本 (a) dismiss_blocking_popups 把弹窗 × 关掉、(b) solve_turnstile
-    找不到 iframe 就当"未出现"放行 → 面板前端自己乱点第一张卡 → Incorrect item
-    tapped，renewal 不动。这里读题目目标词，找到对应图标卡并点它。
+    2026-11-24 run 45349187819 根因：面板 renew 弹 canvas 点选
+    ("Tap the Coffee card")，不是 Turnstile。旧脚本关弹窗 + 不认 canvas，
+    面板前端自己乱点第一张卡 → Incorrect item tapped，renewal 不动。
 
-    返回: "solved" / "no-modal"（非 canvas 模式）/ "unknown"（识别不到）
+    v3 关键洞察（run 45352487314 / 45353394555 实测）：
+      - 卡片里是内联 <svg width=24 height=24>（无 lucide-* class）；
+      - 标题「Tap the Star card」旁的小图标是 svg.lucide-star（有 class）。
+    两者是同一个 lucide 图标，path d 相同 → 用小图标的 path 当指纹，
+    去卡片里找 path 相同的那张，点它。
+
+    返回: "solved" / "no-modal" / "unknown"
     """
     target = None
     deadline = time.time() + max_wait
@@ -751,51 +755,53 @@ def solve_canvas_captcha(page, max_wait=45):
 
     log.info("  🎯 canvas 点选挑战: Tap the %s card", target)
 
-    # 探测 JS：读题目 + 列出所有"卡片方框"。卡片 svg 的 class 也是
-    # "lucide lucide-moon h-5 w-5"，按尺寸排不掉；真正的区别是卡片 svg
-    # 坐在一个 60-90px 的方框里，标题旁提示图标的祖先很小 → 向上找方框。
     DETECT_JS = """() => {
         const t = document.body ? document.body.innerText : '';
         const m = /Tap the\\s+([A-Za-z]+)\\s+card/i.exec(t);
-        const target = m ? m[1].toLowerCase() : null;
+        const cur = m ? m[1].toLowerCase() : null;
         const err = /Incorrect item tapped|verification failed|Try again/i.test(t);
         const modal = /Renew Server|QUICK VERIFICATION/i.test(t);
-        const svgs = [...document.querySelectorAll('svg.lucide')];
-        const seen = new Set();
-        const cards = [];
-        for (const svg of svgs) {
-            const iconCls = svg.getAttribute('class') || '';
-            const im = /lucide-([a-z0-9-]+)/.exec(iconCls);
-            const icon = im ? im[1] : '';
+        const dstr = s => [...s.querySelectorAll('path,circle,line,rect,polyline,polygon')]
+                             .map(p => (p.getAttribute('d')||p.getAttribute('cx')||
+                                        p.getAttribute('x1')||'')).join('|').slice(0,400);
+        // 提示图标：带 lucide class 且尺寸 <= 30 的小 svg（标题旁）。
+        // 优先取 class 名匹配当前题目词的那个。
+        const small = [...document.querySelectorAll('svg.lucide')].filter(s => {
+            const r = s.getBoundingClientRect(); return r.width <= 30 && r.height <= 30;
+        });
+        let ref = null;
+        const match = small.find(s => (s.getAttribute('class')||'').toLowerCase().includes('lucide-'+cur));
+        if (match) ref = dstr(match);
+        // 卡片：有 45-130px 方框的 div，内含 svg（卡片 svg 无 lucide class）。
+        const seen = new Set(); const cards = [];
+        for (const svg of document.querySelectorAll('svg')) {
             let box = null, el = svg;
-            for (let i=0; i<5 && el; i++) {
-                el = el.parentElement;
-                if (!el) break;
+            for (let i=0;i<5 && el;i++) {
+                el = el.parentElement; if (!el) break;
                 const r = el.getBoundingClientRect();
-                if (r.width >= 45 && r.width <= 130 && r.height >= 45 && r.height <= 130) {
-                    box = el; break;
-                }
+                if (r.width>=45 && r.width<=130 && r.height>=45 && r.height<=130) { box=el; break; }
             }
             if (!box || seen.has(box)) continue;
             seen.add(box);
             const r = box.getBoundingClientRect();
-            cards.push({icon: icon, tag: box.tagName,
+            cards.push({tag: box.tagName, d: dstr(svg),
+                        cls: (svg.getAttribute('class')||'').slice(0,80),
                         x: Math.round(r.left+r.width/2), y: Math.round(r.top+r.height/2),
-                        w: Math.round(r.width), h: Math.round(r.height),
-                        html: box.outerHTML.slice(0,220)});
+                        html: box.outerHTML.slice(0,400)});
         }
-        return {target: target, err: err, cards: cards, modal: modal};
+        return {target: cur, err: err, modal: modal, ref: ref,
+                smallClasses: small.map(s=>s.getAttribute('class')).slice(0,10),
+                cards: cards};
     }"""
     synonyms = {
-        "coffee": ["coffee", "cup", "coffeecup", "mug"],
-        "flame": ["flame", "fire"], "star": ["star"], "bell": ["bell"],
-        "key": ["key"], "heart": ["heart"], "moon": ["moon"],
-        "sun": ["sun"], "leaf": ["leaf"], "music": ["music", "music2"],
+        "coffee": ["coffee", "cup", "mug"], "flame": ["flame", "fire"],
+        "star": ["star"], "bell": ["bell"], "key": ["key"],
+        "heart": ["heart"], "moon": ["moon"], "sun": ["sun"],
+        "leaf": ["leaf"], "music": ["music"], "gem": ["gem", "diamond"],
+        "rocket": ["rocket"], "zap": ["zap"], "crown": ["crown"],
     }
 
     try:
-        # 每次尝试都重新读题目+重探测（卡片顺序会重排），点正确方框。
-        # 面板前端还有个 ~49s 自动乱点定时器，抢在它耗光机会前完成。
         for attempt in range(5):
             st = page.evaluate(DETECT_JS)
             if not st.get("modal") and not st.get("target"):
@@ -803,27 +809,36 @@ def solve_canvas_captcha(page, max_wait=45):
                 return "solved"
             cur = (st.get("target") or target).lower()
             cards = st.get("cards", [])
-            log.info("  canvas: [%d] 题目=%s 识别到 %d 张卡 err=%s",
-                     attempt + 1, cur, len(cards), st.get("err"))
+            ref = st.get("ref") or ""
+            log.info("  canvas: [%d] 题目=%s 卡片=%d 指纹=%s 小图标=%s",
+                     attempt + 1, cur, len(cards), bool(ref), st.get("smallClasses"))
             for i, c in enumerate(cards):
-                log.info("    [%d] icon=%r %s %dx%d xy=(%d,%d)",
-                         i, c.get("icon",""), c["tag"], c.get("w",0),
-                         c.get("h",0), c["x"], c["y"])
-            keys = synonyms.get(cur, [cur])
+                log.info("    [%d] %s xy=(%d,%d) d=%s cls=%r",
+                         i, c["tag"], c["x"], c["y"], c.get("d","")[:70], c.get("cls",""))
+
             hit = None
-            for c in cards:
-                if any(k in c.get("icon","").lower() for k in keys):
-                    hit = c; break
+            if ref:
+                # path 指纹相等（或一方包含另一方）→ 同一图标
+                for c in cards:
+                    d = c.get("d","")
+                    if d and (d == ref or d in ref or ref in d):
+                        hit = c; break
+            if not hit:
+                # 兜底：卡片 class 含目标词
+                keys = synonyms.get(cur, [cur])
+                for c in cards:
+                    if any(k in c.get("cls","").lower() for k in keys):
+                        hit = c; break
             if not hit:
                 log.warning("  canvas: 找不到 %s 卡；DOM: %s",
-                            cur, " | ".join(c.get("html","")[:180] for c in cards)[:1800])
+                            cur, " | ".join(c.get("html","")[:250] for c in cards)[:2200])
                 page.wait_for_timeout(1500)
                 continue
             page.mouse.click(hit["x"], hit["y"])
-            log.info("  ✅ canvas: 点了 %s @ (%d,%d) (第 %d 次)",
+            log.info("  ✅ canvas: 点了 %s 卡 @ (%d,%d) (第 %d 次)",
                      cur, hit["x"], hit["y"], attempt + 1)
             page.wait_for_timeout(3500)
-        log.warning("  canvas: %d 次尝试后仍未通过", 5)
+        log.warning("  canvas: 5 次尝试后仍未通过")
         return "unknown"
     except Exception as e:
         log.warning("  canvas: 点击失败: %s", e)
