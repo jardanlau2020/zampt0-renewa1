@@ -723,13 +723,12 @@ def solve_canvas_captcha(page, max_wait=45):
 
     2026-11-24 run 45349187819 根因：面板 renew 弹 canvas 点选
     ("Tap the Coffee card")，不是 Turnstile。旧脚本关弹窗 + 不认 canvas，
-    面板前端自己乱点第一张卡 → Incorrect item tapped，renewal 不动。
+    面板前端乱点第一张卡 → Incorrect item tapped，renewal 不动。
 
-    v3 关键洞察（run 45352487314 / 45353394555 实测）：
-      - 卡片里是内联 <svg width=24 height=24>（无 lucide-* class）；
-      - 标题「Tap the Star card」旁的小图标是 svg.lucide-star（有 class）。
-    两者是同一个 lucide 图标，path d 相同 → 用小图标的 path 当指纹，
-    去卡片里找 path 相同的那张，点它。
+    v4（三次实测后）：卡片在「Renew Server / Tap the X card」弹窗内，
+    标题旁提示图标是 svg.lucide-<目标词>（小），卡片里是内联 svg（无
+    lucide class）。用提示图标的 path 当指纹，在弹窗内按 y 坐标分组
+    锁定卡片行（4 个同 y 的图标），找 path 相同的卡点它。
 
     返回: "solved" / "no-modal" / "unknown"
     """
@@ -761,37 +760,51 @@ def solve_canvas_captcha(page, max_wait=45):
         const cur = m ? m[1].toLowerCase() : null;
         const err = /Incorrect item tapped|verification failed|Try again/i.test(t);
         const modal = /Renew Server|QUICK VERIFICATION/i.test(t);
-        const dstr = s => [...s.querySelectorAll('path,circle,line,rect,polyline,polygon')]
-                             .map(p => (p.getAttribute('d')||p.getAttribute('cx')||
-                                        p.getAttribute('x1')||'')).join('|').slice(0,400);
-        // 提示图标：带 lucide class 且尺寸 <= 30 的小 svg（标题旁）。
-        // 优先取 class 名匹配当前题目词的那个。
-        const small = [...document.querySelectorAll('svg.lucide')].filter(s => {
-            const r = s.getBoundingClientRect(); return r.width <= 30 && r.height <= 30;
+        // 1) 找弹窗根：包含 "Tap the X card"、有 >=2 个 svg、文本 < 600 的最小 div。
+        const cands = [...document.querySelectorAll('div,section')].filter(el => {
+            const txt = el.innerText || '';
+            return /Tap the\\s+\\w+\\s+card/i.test(txt) &&
+                   el.querySelectorAll('svg').length >= 2 && txt.length < 600;
         });
-        let ref = null;
-        const match = small.find(s => (s.getAttribute('class')||'').toLowerCase().includes('lucide-'+cur));
-        if (match) ref = dstr(match);
-        // 卡片：有 45-130px 方框的 div，内含 svg（卡片 svg 无 lucide class）。
-        const seen = new Set(); const cards = [];
-        for (const svg of document.querySelectorAll('svg')) {
-            let box = null, el = svg;
-            for (let i=0;i<5 && el;i++) {
-                el = el.parentElement; if (!el) break;
-                const r = el.getBoundingClientRect();
-                if (r.width>=45 && r.width<=130 && r.height>=45 && r.height<=130) { box=el; break; }
-            }
-            if (!box || seen.has(box)) continue;
-            seen.add(box);
-            const r = box.getBoundingClientRect();
-            cards.push({tag: box.tagName, d: dstr(svg),
-                        cls: (svg.getAttribute('class')||'').slice(0,80),
-                        x: Math.round(r.left+r.width/2), y: Math.round(r.top+r.height/2),
-                        html: box.outerHTML.slice(0,400)});
+        // 关键修复：取 svg 最多的容器（含卡片的弹窗），不是文本最短的（标题 div）。
+        cands.sort((a,b) => b.querySelectorAll('svg').length - a.querySelectorAll('svg').length);
+        if (!cands.length) return {target: cur, err: err, modal: modal, cards: [], note: 'no-root'};
+        const root = cands[0];
+        // 2) 提示图标：root 内 svg.lucide-xxx 且小尺寸(<=30)，优先匹配当前题目词。
+        const dstr = s => [...s.querySelectorAll('path,circle,line,rect,polyline,polygon')]
+                            .map(p => (p.getAttribute('d')||p.getAttribute('cx')||
+                                       p.getAttribute('x1')||'')).join('|').slice(0,500);
+        const small = [...root.querySelectorAll('svg.lucide')].filter(s => {
+            const r = s.getBoundingClientRect(); return r.width<=30 && r.height<=30;
+        });
+        const hint = small.find(s => (s.getAttribute('class')||'').toLowerCase().includes('lucide-'+cur));
+        const ref = hint ? dstr(hint) : '';
+        // 3) 卡片行：root 内所有 svg，按中心 y 分组，取元素数最多的一组
+        //    （4 张卡同 y；标题提示图标 y 不同且只有 1 个）。
+        const items = [];
+        for (const svg of root.querySelectorAll('svg')) {
+            const r = svg.getBoundingClientRect();
+            if (r.width < 10 || r.height < 10) continue;
+            let box = svg.parentElement;
+            const br = box ? box.getBoundingClientRect() : r;
+            items.push({y: Math.round(r.top+r.height/2),
+                        x: Math.round((br.left||r.left)+(br.width||r.width)/2),
+                        by: Math.round(br.top+br.height/2),
+                        d: dstr(svg), cls: (svg.getAttribute('class')||'').slice(0,80),
+                        w: Math.round(br.width||r.width), h: Math.round(br.height||r.height),
+                        html: (box?box.outerHTML:svg.outerHTML).slice(0,400)});
         }
+        const groups = {};
+        for (const it of items) { const k = Math.round(it.by/10)*10; (groups[k]=groups[k]||[]).push(it); }
+        let row = [];
+        for (const k of Object.keys(groups)) if (groups[k].length > row.length) row = groups[k];
+        const cards = row.map(it => ({tag:'CARD', x:it.x, y:it.by, w:it.w, h:it.h,
+                                      d:it.d, cls:it.cls, html:it.html}));
         return {target: cur, err: err, modal: modal, ref: ref,
-                smallClasses: small.map(s=>s.getAttribute('class')).slice(0,10),
-                cards: cards};
+                smallClasses: small.map(s=>s.getAttribute('class')),
+                allGroups: Object.keys(groups).map(k=>k+':'+groups[k].length),
+                cards: cards,
+                rootHtml: root.outerHTML.slice(0,4000)};
     }"""
     synonyms = {
         "coffee": ["coffee", "cup", "mug"], "flame": ["flame", "fire"],
@@ -810,21 +823,23 @@ def solve_canvas_captcha(page, max_wait=45):
             cur = (st.get("target") or target).lower()
             cards = st.get("cards", [])
             ref = st.get("ref") or ""
-            log.info("  canvas: [%d] 题目=%s 卡片=%d 指纹=%s 小图标=%s",
-                     attempt + 1, cur, len(cards), bool(ref), st.get("smallClasses"))
+            log.info("  canvas: [%d] 题目=%s 卡片=%d 指纹=%s 分组=%s 小图标=%s",
+                     attempt + 1, cur, len(cards), bool(ref), st.get("allGroups"),
+                     st.get("smallClasses"))
+            if attempt == 0:
+                log.info("  canvas ROOT DOM: %s", (st.get("rootHtml") or "")[:3500])
             for i, c in enumerate(cards):
-                log.info("    [%d] %s xy=(%d,%d) d=%s cls=%r",
-                         i, c["tag"], c["x"], c["y"], c.get("d","")[:70], c.get("cls",""))
+                log.info("    [%d] %s %dx%d xy=(%d,%d) d=%s cls=%r",
+                         i, c["tag"], c.get("w",0), c.get("h",0), c["x"], c["y"],
+                         c.get("d","")[:60], c.get("cls",""))
 
             hit = None
             if ref:
-                # path 指纹相等（或一方包含另一方）→ 同一图标
                 for c in cards:
                     d = c.get("d","")
-                    if d and (d == ref or d in ref or ref in d):
+                    if d and (d == ref or (len(d)>40 and d in ref) or (len(ref)>40 and ref in d)):
                         hit = c; break
             if not hit:
-                # 兜底：卡片 class 含目标词
                 keys = synonyms.get(cur, [cur])
                 for c in cards:
                     if any(k in c.get("cls","").lower() for k in keys):
