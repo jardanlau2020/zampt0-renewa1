@@ -1920,6 +1920,21 @@ def phase_api_renewal(use_cookies=None) -> RenewReport:
                                             break
                                         # CSRF 失败换下一个组合; 其他业务错误(如冷却期)则停止
                                         if resp.status_code != 403 or "csrf" not in resp.text.lower():
+                                            # 2026-11-28：#285 的假阴性来源就在这 —— 400
+                                            # 「Security verification failed」被当普通业务错误
+                                            # 直接 break，下面那段 captcha 判定根本走不到，
+                                            # error 退化成 "could not find correct body format"，
+                                            # TG 于是说不出「需手点」。
+                                            if _is_security_check(resp.text):
+                                                report["need_manual"] = True
+                                                report["error"] = ("面板要求安全验证（%s）"
+                                                                   % _security_provider(resp.text))
+                                                log.warning("    ⚠️ 面板要求安全验证，脚本无法自动通过")
+                                                # 置 renew_success 让外层 `if renew_success: break`
+                                                # 干净收口；否则外层会换 X-CSRF-Token 再撞同一堵
+                                                # 墙，白多打一轮请求（QA 复核提出）。
+                                                renew_success = True
+                                                break
                                             renew_success = True  # CSRF 已通过, 是业务错误
                                             break
                                     except Exception as e:
@@ -1933,6 +1948,7 @@ def phase_api_renewal(use_cookies=None) -> RenewReport:
                             if "captcha" in resp.text.lower() or "verification" in resp.text.lower():
                                 log.warning("    API requires captcha - cannot auto-renew without solving Turnstile")
                                 report["error"] = "Captcha required: " + resp.text[:200]
+                                report["need_manual"] = True
                                 break  # Don't try more variants, captcha is the blocker
                         except Exception as e:
                             log.warning("    Request failed: %s", e)
@@ -2110,7 +2126,44 @@ def _human_summary(report, outcome, hours) -> str:
     if outcome is Outcome.FAILED and "captcha" in str(report.get("error") or "").lower():
         lines += ["", "**请手动续期**",
                   "API 续期需要人机验证，请在浏览器中打开 Zampto 控制台手动续期。"]
+    elif outcome is Outcome.FAILED and report.get("need_manual"):
+        lines += ["", "**请手动续期**",
+                  "面板要求安全验证（%s），脚本过不去 —— "
+                  "请在浏览器中打开 dash.zampto.net 手动点一次 Renew。"
+                  % _security_provider(report.get("error") or "")]
     return "\n".join(lines)
+
+
+_SEC_CHECK_MARKERS = (
+    "security verification",      # #285 原话：Security verification failed
+    "complete the security",      # #285 原话：Please complete the security check
+    "verification required",
+    "captcha",                    # 含 captchaProvider / hcaptcha / recaptcha
+    # 裸 "challenge" 故意不收：它可能出现在无关文案里，一旦误命中，
+    # need_manual 会把真实原因（冷却期、出口被标记）覆盖成「撞安全验证」。
+    # #285 那次靠上面几个 marker 已能命中，去掉不影响。
+)
+
+
+def _is_security_check(text) -> bool:
+    """面板响应是否属于「需要人机验证」这一类。
+
+    与 solve_turnstile 里那份页面特征表同源，但这里扫的是 **HTTP 响应体**
+    （400/200 JSON），不是页面可见文本 —— 面板用 JSON 回 captchaProvider
+    时，老代码只看「是否 403 且含 csrf」，就把它混进了普通业务错误。
+    """
+    low = str(text or "").lower()
+    return any(m in low for m in _SEC_CHECK_MARKERS)
+
+
+def _security_provider(text) -> str:
+    """从响应里挑出验证提供方，给通知文案用；挑不到就说「安全验证」。"""
+    low = str(text or "").lower()
+    if "hcaptcha" in low:
+        return "hCaptcha"
+    if "turnstile" in low:
+        return "Turnstile"
+    return "安全验证"
 
 
 def _to_renew_report(report) -> RenewReport:
@@ -2131,6 +2184,13 @@ def _to_renew_report(report) -> RenewReport:
         detail = f"服務已自動展期（{hours}h 後到期）"
     elif outcome is Outcome.FAILED and not detail:
         detail = "續期未完成"
+
+    # 2026-11-28：撞安全验证时让 detail 直接说清要人干什么。
+    # renewkit 渲染的是 l2 = "⚠️ {detail} · 请登录面板手动处理"，
+    # 所以只补 detail 即可 —— 不新增通知、不改消息条数。
+    if outcome is Outcome.FAILED and report.get("need_manual"):
+        detail = "撞安全驗證·需手點續期（%s）" % _security_provider(
+            report.get("error") or "")
 
     log.info("--- Report ---\n%s", _human_summary(report, outcome, hours))
     _save_report_json(report)
